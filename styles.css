@@ -1,0 +1,331 @@
+:root{
+  --bg:#0d0f14;
+  --panel:#151820;
+  --panel2:#1b1f29;
+  --line:#2a3040;
+  --text:#f4f6fb;
+  --muted:#9aa4b5;
+  --accent:#7c9cff;
+  --accent2:#9b7cff;
+  --danger:#ff6b7d;
+  --radius:16px;
+  --track-h:54px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+button,input,select,textarea{font:inherit}
+button,.file-button{border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:9px 12px;border-radius:10px;cursor:pointer}
+button:hover,.file-button:hover{border-color:#44506a}
+button:disabled{opacity:.4;cursor:not-allowed}
+.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));border:0;color:#0b0d12;font-weight:800}
+.ghost{background:transparent}
+.subtle{background:#11141b}
+.app-shell{min-height:100vh;display:flex;flex-direction:column}
+.topbar{height:64px;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-bottom:1px solid var(--line);background:rgba(13,15,20,.92);backdrop-filter:blur(14px);position:sticky;top:0;z-index:50}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-mark{width:36px;height:36px;display:grid;place-items:center;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent2));font-weight:900;color:#0b0d12}
+.brand div:last-child{display:flex;flex-direction:column}
+.brand span{font-size:12px;color:var(--muted);max-width:180px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{display:flex;gap:8px}
+.workspace{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(250px,.7fr);grid-template-areas:"preview media" "timeline timeline" "inspector inspector";gap:12px;padding:12px;min-height:calc(100vh - 64px)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.preview-panel{grid-area:preview}
+.media-panel{grid-area:media;min-height:300px}
+.timeline-panel{grid-area:timeline}
+.inspector{grid-area:inspector}
+.preview-stage-wrap{height:min(51vw,58vh);min-height:300px;display:grid;place-items:center;background:#07080b;position:relative;padding:14px}
+#previewCanvas{max-width:100%;max-height:100%;width:auto;height:auto;background:#000;border-radius:8px;box-shadow:0 16px 60px rgba(0,0,0,.35)}
+.empty-preview{position:absolute;z-index:10;text-align:center;padding-top:100px;color:var(--muted);display:flex;flex-direction:column;gap:5px;pointer-events:none}
+.empty-preview strong{color:var(--text)}
+.transport{display:flex;align-items:center;gap:8px;padding:10px;border-top:1px solid var(--line)}
+.transport .play{width:44px}
+.time-label{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
+.zoom-control{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}
+.zoom-control input{width:100px}
+.panel-heading{display:flex;justify-content:space-between;align-items:center;padding:14px;border-bottom:1px solid var(--line)}
+.panel-heading>div{display:flex;flex-direction:column}
+.panel-heading span{font-size:12px;color:var(--muted)}
+.drop-zone{margin:12px;border:1px dashed #47536d;border-radius:12px;padding:20px;text-align:center;color:var(--muted);transition:.2s}
+.drop-zone.drag{border-color:var(--accent);background:rgba(124,156,255,.08)}
+.media-bin{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;padding:0 12px 14px;max-height:420px;overflow:auto}
+.media-card{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:9px;min-width:0}
+.media-thumb{height:76px;border-radius:8px;background:#0c0f15;display:grid;place-items:center;overflow:hidden;color:var(--muted);font-size:12px}
+.media-thumb img,.media-thumb video{width:100%;height:100%;object-fit:cover}
+.media-name{font-size:12px;margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.media-meta{font-size:11px;color:var(--muted);margin-top:3px}
+.media-card button{width:100%;margin-top:7px;padding:7px}
+.timeline-toolbar{display:flex;gap:7px;flex-wrap:wrap;padding:10px;border-bottom:1px solid var(--line)}
+.timeline-shell{display:grid;grid-template-columns:132px minmax(0,1fr);height:330px}
+.timeline-side{border-right:1px solid var(--line);background:#11141a;overflow:hidden}
+.side-spacer{height:32px;padding:7px 10px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--line)}
+.track-header{height:var(--track-h);display:flex;align-items:center;justify-content:space-between;padding:0 8px;border-bottom:1px solid var(--line);font-size:12px}
+.track-header span{max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.track-header button{padding:4px 7px;font-size:11px}
+.timeline-main{position:relative;overflow:auto;background:#0f1218}
+.ruler{height:32px;position:relative;border-bottom:1px solid var(--line);min-width:100%}
+.ruler-mark{position:absolute;top:0;bottom:0;border-left:1px solid #394154;font-size:10px;color:var(--muted);padding:4px 0 0 4px;pointer-events:none}
+.tracks{position:relative;min-width:100%}
+.track-row{height:var(--track-h);position:relative;border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.01),transparent)}
+.clip{position:absolute;top:6px;height:42px;border-radius:9px;border:1px solid rgba(255,255,255,.15);padding:6px 8px;cursor:grab;overflow:hidden;user-select:none;touch-action:none;background:linear-gradient(135deg,#31416f,#2b3350);box-shadow:0 4px 14px rgba(0,0,0,.15)}
+.clip.audio{background:linear-gradient(135deg,#3b664f,#284638)}
+.clip.image{background:linear-gradient(135deg,#6c4e7c,#453550)}
+.clip.subtitle{background:linear-gradient(135deg,#7a5c2e,#4d391f)}
+.clip.selected{outline:2px solid var(--accent);outline-offset:1px}
+.clip-title{font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.clip-meta{font-size:10px;color:rgba(255,255,255,.7);font-variant-numeric:tabular-nums}
+.playhead{position:absolute;top:0;bottom:0;width:2px;background:var(--danger);z-index:30;pointer-events:none;transform:translateX(0)}
+.playhead span{position:absolute;top:0;left:-5px;width:12px;height:12px;background:var(--danger);clip-path:polygon(0 0,100% 0,50% 100%)}
+.inspector-body{padding:14px;display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px}
+.inspector-body label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}
+.inspector-body input,.inspector-body select,.dialog-card input,.dialog-card select,.dialog-card textarea{background:#0e1117;color:var(--text);border:1px solid var(--line);padding:9px;border-radius:9px;width:100%}
+.placeholder{color:var(--muted);font-size:13px}
+dialog{border:0;padding:0;background:transparent;color:var(--text);max-width:calc(100vw - 20px)}
+dialog::backdrop{background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}
+.dialog-card{width:min(520px,calc(100vw - 24px));background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:14px}
+.dialog-card.wide{width:min(780px,calc(100vw - 24px))}
+.dialog-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.dialog-title .muted{font-size:12px;margin-top:3px}
+.icon-btn{padding:5px 8px}
+.dialog-card label{display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.dialog-actions,.backup-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.muted{color:var(--muted)}
+.backup-list{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow:auto}
+.backup-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px;border:1px solid var(--line);border-radius:11px;background:#11141a}
+.backup-item small{display:block;color:var(--muted);margin-top:3px}
+.backup-item-actions{display:flex;gap:6px}
+.backup-item-actions button{padding:6px 8px;font-size:12px}
+.export-status{min-height:20px;color:var(--muted);font-size:13px}
+@media(max-width:900px){
+  .workspace{grid-template-columns:1fr;grid-template-areas:"preview" "timeline" "media" "inspector"}
+  .preview-stage-wrap{height:42vh;min-height:230px}
+  .media-panel{min-height:0}
+  .media-bin{grid-template-columns:repeat(3,minmax(0,1fr));max-height:250px}
+  .inspector-body{grid-template-columns:repeat(2,minmax(120px,1fr))}
+}
+@media(max-width:640px){
+  :root{--track-h:58px}
+  .topbar{padding:0 10px;height:58px}
+  .brand span{max-width:110px}
+  .top-actions .ghost{display:none}
+  .top-actions button{padding:8px 10px}
+  .workspace{padding:8px;gap:8px;min-height:calc(100vh - 58px)}
+  .preview-stage-wrap{height:34vh;min-height:200px;padding:8px}
+  .transport{overflow-x:auto}
+  .zoom-control{display:none}
+  .timeline-panel{border-radius:12px}
+  .timeline-toolbar{overflow-x:auto;flex-wrap:nowrap}
+  .timeline-toolbar button{white-space:nowrap}
+  .timeline-shell{grid-template-columns:96px 1fr;height:360px}
+  .track-header span{max-width:52px}
+  .media-bin{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .inspector-body{grid-template-columns:1fr 1fr}
+  .backup-item{align-items:flex-start;flex-direction:column}
+  .backup-item-actions{width:100%}
+  .backup-item-actions button{flex:1}
+}
+.keyframe-marker{position:absolute;bottom:2px;width:7px;height:7px;background:#fff;transform:translateX(-50%) rotate(45deg);border-radius:1px;box-shadow:0 0 0 1px rgba(0,0,0,.5)}
+.keyframe-editor{grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;margin-top:2px}
+.keyframe-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.keyframe-head>div{display:flex;flex-direction:column;gap:2px}.keyframe-head span{font-size:11px;color:var(--muted)}
+.keyframe-list{display:flex;flex-wrap:wrap;gap:7px}.keyframe-row{display:flex;gap:5px}.keyframe-row button{padding:6px 8px;font-size:11px}
+
+.preview-play{
+  position:absolute;
+  left:50%;
+  top:50%;
+  transform:translate(-50%,-50%);
+  z-index:20;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:10px;
+  min-width:132px;
+  height:64px;
+  padding:0 22px;
+  border-radius:999px;
+  border:2px solid rgba(255,255,255,.8);
+  background:rgba(12,15,21,.82);
+  color:#fff;
+  font-weight:900;
+  font-size:18px;
+  box-shadow:0 10px 35px rgba(0,0,0,.45);
+  backdrop-filter:blur(8px);
+}
+.preview-play:hover{transform:translate(-50%,-50%) scale(1.03)}
+.preview-play-icon{font-size:22px;line-height:1}
+.preview-play-label{line-height:1}
+.transport .play{min-width:96px;font-weight:800}
+@media(max-width:640px){
+  .preview-play{min-width:124px;height:58px;font-size:17px}
+}
+
+.preview-play.is-playing{
+  opacity:0;
+  pointer-events:none;
+}
+#previewCanvas{cursor:pointer}
+
+.fullscreen-btn{margin-left:auto;white-space:nowrap}
+
+/* Fullscreen uses the entire preview panel, so the video never covers its controls. */
+.preview-panel:fullscreen{
+  width:100vw;
+  height:100vh;
+  max-width:none;
+  max-height:none;
+  display:flex;
+  flex-direction:column;
+  border:0;
+  border-radius:0;
+  background:#000;
+}
+.preview-panel:fullscreen .preview-stage-wrap{
+  flex:1 1 auto;
+  width:100%;
+  height:auto;
+  min-height:0;
+  max-height:none;
+  padding:0;
+  background:#000;
+}
+.preview-panel:fullscreen #previewCanvas{
+  max-width:100%;
+  max-height:100%;
+  width:auto;
+  height:auto;
+  margin:auto;
+  border-radius:0;
+}
+.preview-panel:fullscreen .transport{
+  flex:0 0 auto;
+  width:100%;
+  border-top:1px solid var(--line);
+  background:rgba(13,15,20,.96);
+}
+
+/* Browser fallback for platforms without the Fullscreen API. */
+.preview-panel.fallback-fullscreen{
+  position:fixed;
+  inset:0;
+  z-index:9999;
+  width:100vw;
+  height:100dvh;
+  max-width:none;
+  max-height:none;
+  display:flex;
+  flex-direction:column;
+  border:0;
+  border-radius:0;
+  background:#000;
+  overflow:hidden;
+}
+.preview-panel.fallback-fullscreen .preview-stage-wrap{
+  flex:1 1 auto;
+  width:100%;
+  height:auto;
+  min-height:0;
+  max-height:none;
+  padding:0;
+  background:#000;
+}
+.preview-panel.fallback-fullscreen #previewCanvas{
+  max-width:100%;
+  max-height:100%;
+  width:auto;
+  height:auto;
+  margin:auto;
+  border-radius:0;
+}
+.preview-panel.fallback-fullscreen .transport{
+  flex:0 0 auto;
+  width:100%;
+  background:rgba(13,15,20,.96);
+}
+body.preview-fallback-fullscreen{overflow:hidden}
+
+@media(max-width:640px){
+  .fullscreen-btn{margin-left:0}
+  .preview-panel:fullscreen .transport,
+  .preview-panel.fallback-fullscreen .transport{
+    overflow-x:auto;
+    flex-wrap:nowrap;
+  }
+}
+
+/* Preview containment: keep video/canvas inside its own panel in every layout. */
+.workspace > *{min-width:0}
+.preview-panel{position:relative;z-index:1;min-width:0;overflow:hidden}
+.preview-stage-wrap{
+  width:100%;
+  max-width:100%;
+  overflow:hidden;
+  contain:layout paint;
+  isolation:isolate;
+}
+#previewCanvas{
+  display:block;
+  position:relative;
+  z-index:1;
+  min-width:0;
+  min-height:0;
+}
+.transport{
+  position:relative;
+  z-index:2;
+  min-width:0;
+  flex-wrap:wrap;
+  background:var(--panel);
+}
+
+/* v7 clip movement / reverse / preview positioning */
+.clip.reverse::after{
+  content:"REV";
+  position:absolute;
+  right:5px;
+  top:4px;
+  padding:2px 4px;
+  border-radius:5px;
+  background:rgba(0,0,0,.48);
+  font-size:8px;
+  font-weight:900;
+  letter-spacing:.05em;
+}
+.track-row.track-drop-target{
+  background:rgba(124,156,255,.12);
+  box-shadow:inset 0 0 0 1px rgba(124,156,255,.45);
+}
+.preview-stage-wrap.position-edit{cursor:grab}
+.preview-stage-wrap.position-edit.dragging-position{cursor:grabbing}
+.keyframe-drag-help{
+  margin-top:8px;
+  padding:9px 10px;
+  border:1px solid var(--line);
+  border-radius:10px;
+  background:#11141a;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.35;
+}
+
+.keyframe-row{
+  align-items:center;
+  padding:5px;
+  border:1px solid var(--line);
+  border-radius:9px;
+  background:#11141a;
+}
+.keyframe-easing{
+  min-width:104px;
+  background:#0e1117;
+  color:var(--text);
+  border:1px solid var(--line);
+  border-radius:7px;
+  padding:6px 7px;
+  font-size:11px;
+}
+@media(max-width:640px){
+  .keyframe-list{flex-direction:column}
+  .keyframe-row{width:100%}
+  .keyframe-row .keyframe-easing{flex:1;min-width:0}
+}
