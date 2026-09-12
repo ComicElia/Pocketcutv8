@@ -215,12 +215,49 @@ function createRuntime(media){
   return runtime;
 }
 function mediaById(id){ return state.media.find(m=>m.id===id); }
+function clipSpeed(c){
+  return clamp(Number(c.speed)||1,.25,100);
+}
+function clipSourceSpan(c){
+  return Math.max(0,(Number(c.duration)||0)*clipSpeed(c));
+}
 function clipLocalTime(c,t){
   const trim=Number(c.trimIn)||0;
+  const speed=clipSpeed(c);
   const rel=clamp(t-c.start,0,c.duration);
-  return c.reverse ? trim + Math.max(0,c.duration-rel) : trim + rel;
+  const sourceSpan=clipSourceSpan(c);
+  return c.reverse
+    ? trim + Math.max(0,sourceSpan-rel*speed)
+    : trim + rel*speed;
 }
 function clipIsActive(c,t){ return t>=c.start && t<c.start+c.duration; }
+
+function setClipSpeed(c,newSpeed){
+  const oldSpeed=clipSpeed(c);
+  newSpeed=clamp(Number(newSpeed)||1,.25,100);
+  if(Math.abs(oldSpeed-newSpeed)<.0001){ c.speed=newSpeed; return; }
+
+  const oldDuration=Math.max(.1,Number(c.duration)||.1);
+  const newDuration=Math.max(.05,oldDuration*oldSpeed/newSpeed);
+  const ratio=newDuration/oldDuration;
+
+  c.speed=newSpeed;
+  c.duration=newDuration;
+
+  // Keep fades and transform keyframes at the same relative place in the clip.
+  c.fadeIn=Math.min(newDuration,Math.max(0,Number(c.fadeIn)||0)*ratio);
+  c.fadeOut=Math.min(newDuration,Math.max(0,Number(c.fadeOut)||0)*ratio);
+  if(Array.isArray(c.keyframes)){
+    for(const k of c.keyframes) k.time=clamp((Number(k.time)||0)*ratio,0,newDuration);
+  }
+
+  if(state.currentTime>c.start+c.duration) state.currentTime=c.start+c.duration;
+  const runtime=state.clipRuntime.get(c.id);
+  if(runtime?.el){
+    try{ runtime.el.pause(); }catch{}
+    try{ runtime.el.playbackRate=newSpeed; }catch{}
+  }
+}
 
 function createClipRuntime(c, media){
   const key=c.id;
@@ -265,6 +302,13 @@ function syncPreviewPlayback(){
       const runtime=createClipRuntime(c,media);
       if(!runtime) continue;
       const el=runtime.el;
+      const speed=clipSpeed(c);
+      try{
+        el.playbackRate=speed;
+        el.defaultPlaybackRate=speed;
+        if("preservesPitch" in el) el.preservesPitch=true;
+        if("webkitPreservesPitch" in el) el.webkitPreservesPitch=true;
+      }catch{}
       activeIds.add(c.id);
       const target=clamp(clipLocalTime(c,state.currentTime),0,Math.max(0,(media.duration||0)-.01));
       const tolerance=state.isPlaying ? .35 : .035;
@@ -514,7 +558,7 @@ function renderTracks(){
       const title=document.createElement("div"); title.className="clip-title";
       title.textContent=c.type==="subtitle"?(c.text||"Subtitle"):(mediaById(c.mediaId)?.name||"Missing media");
       const meta=document.createElement("div"); meta.className="clip-meta";
-      meta.textContent=`${fmt(c.start)} • ${fmt(c.duration)}`;
+      meta.textContent=`${fmt(c.start)} • ${fmt(c.duration)}${(["video","audio"].includes(c.type) && Math.abs(clipSpeed(c)-1)>.001)?` • ${clipSpeed(c)}×`:""}`;
       div.append(title,meta);
       if((c.type==="video"||c.type==="image") && (c.keyframes||[]).length){
         for(const k of c.keyframes){
@@ -546,7 +590,9 @@ function renderInspector(){
     ["Text","text","text"],["Start","start","number"],["Duration","duration","number"],
     ["Text size","fontScale","number"],["Vertical position","y","number"],["Color","color","color"]
   ] : [
-    ["Start","start","number"],["Duration","duration","number"],["Trim in","trimIn","number"],
+    ["Start","start","number"],["Duration","duration","number"],
+    ...(["video","audio"].includes(c.type) ? [["Speed ×","speed","number"]] : []),
+    ["Trim in","trimIn","number"],
     ["Fade in","fadeIn","number"],["Fade out","fadeOut","number"],["Opacity","opacity","number"],
     ["Scale","scale","number"],["X position","x","number"],["Y position","y","number"],
     ["Rotation","rotation","number"],["Volume","volume","number"]
@@ -560,13 +606,16 @@ function renderInspector(){
       if(["opacity","x","y"].includes(key)){input.min="0";input.max="1";}
       if(key==="scale"){input.min=".05";input.max="5";}
       if(key==="volume"){input.min="0";input.max="2";}
+      if(key==="speed"){input.min=".25";input.max="100";input.step=".25";}
       if(key==="fontScale"){input.min=".015";input.max=".15";input.step=".005";}
     }
     input.value=(visualNow && VISUAL_KEYS.includes(key)) ? visualNow[key] : (c[key] ?? defaultClipValue(key));
     input.onchange=()=>{
       commitHistory();
       const value=type==="number"?Number(input.value):input.value;
-      if(visualNow && VISUAL_KEYS.includes(key) && (c.keyframes||[]).length && state.currentTime>=c.start && state.currentTime<=c.start+c.duration){
+      if(key==="speed"){
+        setClipSpeed(c,value);
+      }else if(visualNow && VISUAL_KEYS.includes(key) && (c.keyframes||[]).length && state.currentTime>=c.start && state.currentTime<=c.start+c.duration){
         upsertKeyframe(c,state.currentTime-c.start,{[key]:value});
       }else c[key]=value;
       if(key==="duration") c.duration=Math.max(.1,c.duration);
@@ -627,7 +676,7 @@ function renderKeyframeEditor(c){
   box.appendChild(list); els.inspector.appendChild(box);
 }
 function defaultClipValue(k){
-  return ({trimIn:0,fadeIn:0,fadeOut:0,opacity:1,scale:1,x:.5,y:.5,rotation:0,volume:1,fontScale:.045,color:"#ffffff"}[k] ?? 0);
+  return ({trimIn:0,fadeIn:0,fadeOut:0,opacity:1,scale:1,x:.5,y:.5,rotation:0,volume:1,speed:1,fontScale:.045,color:"#ffffff"}[k] ?? 0);
 }
 function renderAll(){
   els.projectNameLabel.textContent=state.project.name;
@@ -704,7 +753,7 @@ function addMediaToTimeline(mediaId){
   const c={
     id:uid(),type:m.type==="audio"?"audio":m.type==="image"?"image":"video",mediaId:m.id,
     start:state.currentTime,duration:m.type==="image"?5:Math.max(.1,m.duration||5),trimIn:0,
-    fadeIn:0,fadeOut:0,opacity:1,scale:1,x:.5,y:.5,rotation:0,volume:1
+    speed:1,fadeIn:0,fadeOut:0,opacity:1,scale:1,x:.5,y:.5,rotation:0,volume:1
   };
   track.clips.push(c); state.selectedClipId=c.id; renderAll();
 }
@@ -730,17 +779,23 @@ function splitSelected(){
   commitHistory();
   const originalDuration=c.duration;
   const originalTrim=Number(c.trimIn)||0;
+  const speed=clipSpeed(c);
   const leftDur=at-c.start;
   const right=deepClone(c); right.id=uid(); right.start=at; right.duration=originalDuration-leftDur;
   if(c.type!=="subtitle"){
     if(c.reverse){
-      c.trimIn=originalTrim+(originalDuration-leftDur);
+      c.trimIn=originalTrim+(originalDuration-leftDur)*speed;
       right.trimIn=originalTrim;
     }else{
-      right.trimIn=originalTrim+leftDur;
+      right.trimIn=originalTrim+leftDur*speed;
     }
   }
   c.duration=leftDur;
+  if(Array.isArray(c.keyframes)){
+    const originalFrames=deepClone(c.keyframes);
+    c.keyframes=originalFrames.filter(k=>k.time<=leftDur+.0001).map(k=>({...k,time:clamp(k.time,0,leftDur)}));
+    right.keyframes=originalFrames.filter(k=>k.time>=leftDur-.0001).map(k=>({...k,time:clamp(k.time-leftDur,0,right.duration)}));
+  }
   track.clips.push(right); state.selectedClipId=right.id; renderAll();
 }
 function duplicateSelected(){
@@ -763,7 +818,7 @@ function detachAudio(){
   const c=sel.clip;
   audioTrack.clips.push({
     id:uid(),type:"audio",mediaId:c.mediaId,start:c.start,duration:c.duration,trimIn:c.trimIn||0,
-    fadeIn:c.fadeIn||0,fadeOut:c.fadeOut||0,volume:1,reverse:!!c.reverse,detachedFrom:c.id
+    fadeIn:c.fadeIn||0,fadeOut:c.fadeOut||0,volume:1,speed:clipSpeed(c),reverse:!!c.reverse,detachedFrom:c.id
   });
   c.volume=0;
   renderAll();
@@ -966,12 +1021,12 @@ async function restoreLatestSession(){
   }
 }
 
-async function syncReverseFramesForTime(t){
+async function syncVideoFramesForTime(t){
   const jobs=[];
   for(const track of state.project.tracks){
     if(!(track.type==="video" || track.type==="overlay")) continue;
     for(const c of track.clips){
-      if(!c.reverse || c.type!=="video" || !clipIsActive(c,t)) continue;
+      if(c.type!=="video" || !clipIsActive(c,t)) continue;
       const media=mediaById(c.mediaId);
       if(!media) continue;
       const runtime=createClipRuntime(c,media);
@@ -1039,10 +1094,15 @@ async function renderAudioMix(duration,status){
     const buffer=await decodeMediaAudio(c.mediaId,offline,cache);
     if(!buffer){skipped.push(mediaById(c.mediaId)?.name||"Unknown media");continue;}
     const offset=Math.max(0,Number(c.trimIn)||0);
-    const available=Math.max(0,Math.min(Number(c.duration)||0,buffer.duration-offset,duration-c.start));
+    const speed=clipSpeed(c);
+    const wantedTimeline=Math.max(0,Math.min(Number(c.duration)||0,duration-c.start));
+    const wantedSource=wantedTimeline*speed;
+    const sourceAvailable=Math.max(0,Math.min(wantedSource,buffer.duration-offset));
+    const available=sourceAvailable/speed;
     if(available<=.001 || c.start>=duration) continue;
     const src=offline.createBufferSource();
-    src.buffer=c.reverse?reversedAudioSegment(offline,buffer,offset,available):buffer;
+    src.buffer=c.reverse?reversedAudioSegment(offline,buffer,offset,sourceAvailable):buffer;
+    src.playbackRate.setValueAtTime(speed,0);
     const gain=offline.createGain(); src.connect(gain).connect(offline.destination);
     const start=Math.max(0,c.start), end=start+available;
     const fadeIn=Math.min(Math.max(0,Number(c.fadeIn)||0),available);
@@ -1053,7 +1113,7 @@ async function renderAudioMix(duration,status){
       const fadeStart=Math.max(start+fadeIn,end-fadeOut);
       gain.gain.setValueAtTime(volume,fadeStart); gain.gain.linearRampToValueAtTime(0,end);
     }else gain.gain.setValueAtTime(volume,end);
-    try{src.start(start,c.reverse?0:offset,available);}catch(err){console.warn(err);}
+    try{src.start(start,c.reverse?0:offset,sourceAvailable);}catch(err){console.warn(err);}
   }
   return {buffer:await offline.startRendering(),skipped:[...new Set(skipped)]};
 }
@@ -1092,7 +1152,7 @@ async function exportWebM(){
     const frame=Math.floor(elapsed*30);
     if(frame!==lastFrame){
       lastFrame=frame; state.currentTime=Math.min(duration,elapsed);
-      await syncReverseFramesForTime(state.currentTime);
+      await syncVideoFramesForTime(state.currentTime);
       renderPreview();
       octx.clearRect(0,0,out.width,out.height); octx.drawImage(els.canvas,0,0,out.width,out.height);
       if(frame%30===0) status.textContent=`Rendering ${Math.min(99,Math.round(elapsed/duration*100))}%`;
