@@ -546,7 +546,17 @@ function renderMediaBin(){
     els.mediaBin.appendChild(p); return;
   }
   for(const m of state.media){
-    const card=document.createElement("div"); card.className="media-card";
+    const card=document.createElement("div");
+    card.className="media-card";
+    card.draggable=true;
+    card.dataset.mediaId=m.id;
+    card.addEventListener("dragstart",(e)=>{
+      e.dataTransfer.effectAllowed="copy";
+      e.dataTransfer.setData("text/pocketcut-media-id",m.id);
+      e.dataTransfer.setData("text/plain",m.id);
+      card.classList.add("dragging-media");
+    });
+    card.addEventListener("dragend",()=>card.classList.remove("dragging-media"));
     const thumb=document.createElement("div"); thumb.className="media-thumb";
     const r=createRuntime(m);
     if(m.type==="image"){
@@ -558,7 +568,14 @@ function renderMediaBin(){
     const meta=document.createElement("div"); meta.className="media-meta";
     meta.textContent=`${m.type}${m.duration?` • ${fmt(m.duration)}`:""}`;
     const add=document.createElement("button"); add.textContent="Add to timeline";
-    add.onclick=()=>addMediaToTimeline(m.id);
+    add.onclick=()=>{
+      const selected=selectedClip();
+      if(selected && trackAcceptsMedia(selected.track,m)){
+        addMediaToTrack(m.id,selected.track,state.currentTime);
+      }else{
+        addMediaToTimeline(m.id);
+      }
+    };
     card.append(thumb,name,meta,add);
     els.mediaBin.appendChild(card);
   }
@@ -591,6 +608,29 @@ function renderTracks(){
     const row=document.createElement("div"); row.className="track-row"; row.dataset.trackId=track.id;
     row.style.width=width+"px";
     row.addEventListener("pointerdown",(e)=>onTimelinePointerDown(e,track));
+    row.addEventListener("dragover",(e)=>{
+      const mediaId=e.dataTransfer.getData("text/pocketcut-media-id")||e.dataTransfer.getData("text/plain");
+      const media=mediaById(mediaId);
+      if(!trackAcceptsMedia(track,media)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect="copy";
+      row.classList.add("media-drop-target");
+    });
+    row.addEventListener("dragleave",(e)=>{
+      if(!row.contains(e.relatedTarget)) row.classList.remove("media-drop-target");
+    });
+    row.addEventListener("drop",(e)=>{
+      e.preventDefault();
+      row.classList.remove("media-drop-target");
+      const mediaId=e.dataTransfer.getData("text/pocketcut-media-id")||e.dataTransfer.getData("text/plain");
+      const media=mediaById(mediaId);
+      if(!trackAcceptsMedia(track,media)) return;
+      const rect=row.getBoundingClientRect();
+      const scrollLeft=row.parentElement?.scrollLeft||0;
+      const x=e.clientX-rect.left+scrollLeft;
+      const startTime=Math.max(0,x/state.pixelsPerSecond);
+      addMediaToTrack(mediaId,track,startTime);
+    });
     for(const c of track.clips){
       const div=document.createElement("div");
       div.className=`clip ${c.type||track.type}${c.reverse?" reverse":""}${c.id===state.selectedClipId?" selected":""}`;
@@ -813,20 +853,46 @@ function preferredTrackForMedia(m){
   if(m.type==="audio") return state.project.tracks.find(t=>t.type==="audio");
   return state.project.tracks.find(t=>t.type==="video");
 }
+function trackAcceptsMedia(track,m){
+  if(!track||!m) return false;
+  if(m.type==="audio") return track.type==="audio";
+  if(m.type==="video"||m.type==="image") return track.type==="video"||track.type==="overlay";
+  return false;
+}
+function addMediaToTrack(mediaId,track,startTime){
+  const m=mediaById(mediaId); if(!m||!trackAcceptsMedia(track,m)) return false;
+  commitHistory();
+  const c={
+    id:uid(),
+    type:m.type==="audio"?"audio":m.type==="image"?"image":"video",
+    mediaId:m.id,
+    start:Math.max(0,Number(startTime)||0),
+    duration:m.type==="image"?5:Math.max(.1,m.duration||5),
+    trimIn:0,
+    speed:1,
+    fadeIn:0,
+    fadeOut:0,
+    opacity:1,
+    scale:1,
+    x:.5,
+    y:.5,
+    rotation:0,
+    volume:1
+  };
+  track.clips.push(c);
+  state.selectedClipId=c.id;
+  state.currentTime=c.start;
+  renderAll();
+  return true;
+}
 function addMediaToTimeline(mediaId){
   const m=mediaById(mediaId); if(!m) return;
-  commitHistory();
   let track=preferredTrackForMedia(m);
   if(!track){
     track={id:uid(),type:m.type==="audio"?"audio":"video",name:m.type==="audio"?"Audio":"Video",clips:[]};
     state.project.tracks.push(track);
   }
-  const c={
-    id:uid(),type:m.type==="audio"?"audio":m.type==="image"?"image":"video",mediaId:m.id,
-    start:state.currentTime,duration:m.type==="image"?5:Math.max(.1,m.duration||5),trimIn:0,
-    speed:1,fadeIn:0,fadeOut:0,opacity:1,scale:1,x:.5,y:.5,rotation:0,volume:1
-  };
-  track.clips.push(c); state.selectedClipId=c.id; renderAll();
+  addMediaToTrack(mediaId,track,state.currentTime);
 }
 function addTrack(type){
   commitHistory();
@@ -1460,6 +1526,22 @@ function installDurationStyles(){
   document.head.appendChild(style);
 }
 
+
+function installMediaDragStyles(){
+  if(document.getElementById("pc-media-drag-styles")) return;
+  const style=document.createElement("style");
+  style.id="pc-media-drag-styles";
+  style.textContent=`
+    .media-card[draggable="true"]{cursor:grab}
+    .media-card.dragging-media{opacity:.55;cursor:grabbing}
+    .track-row.media-drop-target{
+      background:rgba(124,156,255,.14)!important;
+      box-shadow:inset 0 0 0 2px rgba(124,156,255,.55);
+    }
+  `;
+  document.head.appendChild(style);
+}
+
 function bind(){
   els.fileInput.onchange=e=>importFiles([...e.target.files]);
   ["dragenter","dragover"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{e.preventDefault();els.dropZone.classList.add("drag")}));
@@ -1499,6 +1581,7 @@ function bind(){
 }
 async function init(){
   installDurationStyles();
+  installMediaDragStyles();
   bind();
   await restoreLatestSession();
   syncSettingsUI(); scheduleAutosave(); renderAll();
