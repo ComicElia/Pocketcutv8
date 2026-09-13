@@ -1803,51 +1803,203 @@ function installTextOverlayControls(){
   document.head.appendChild(style);
 }
 
+
+function showPocketCutError(message){
+  console.error("[PocketCut]",message);
+  let bar=document.getElementById("pc-runtime-error");
+  if(!bar){
+    bar=document.createElement("div");
+    bar.id="pc-runtime-error";
+    Object.assign(bar.style,{
+      position:"fixed",left:"10px",right:"10px",bottom:"10px",zIndex:"99999",
+      padding:"10px 12px",borderRadius:"8px",background:"#5b1d1d",color:"#fff",
+      font:"14px/1.35 system-ui,sans-serif",boxShadow:"0 4px 18px rgba(0,0,0,.35)"
+    });
+    document.body.appendChild(bar);
+  }
+  bar.textContent="PocketCut recovered from an error: "+String(message||"Unknown error");
+}
+
+function normalizeProjectState(){
+  if(!state.project || typeof state.project!=="object") state.project={};
+  if(!Array.isArray(state.project.tracks)) state.project.tracks=[];
+  state.project.name=state.project.name||"Untitled project";
+  state.project.aspect=state.project.aspect||"16:9";
+  state.project.backupInterval=Number.isFinite(Number(state.project.backupInterval))?Number(state.project.backupInterval):15;
+
+  const validTypes=new Set(["video","overlay","audio","subtitle","text"]);
+  state.project.tracks=state.project.tracks.filter(t=>t && typeof t==="object");
+  for(const t of state.project.tracks){
+    if(!t.id) t.id=uid();
+    if(!validTypes.has(t.type)) t.type="video";
+    if(!Array.isArray(t.clips)) t.clips=[];
+    if(!t.name) t.name=t.type==="audio"?"Audio":t.type==="subtitle"?"Subtitles":t.type==="text"?"Text":"Video";
+    t.clips=t.clips.filter(c=>c && typeof c==="object");
+    for(const c of t.clips){
+      if(!c.id) c.id=uid();
+      c.start=Math.max(0,Number(c.start)||0);
+      c.duration=Math.max(.05,Number(c.duration)||5);
+      if(c.type==="video" || c.type==="audio"){
+        c.speed=clamp(Number(c.speed)||1,.25,100);
+      }
+      if(c.type==="image" || c.type==="video"){
+        c.opacity=Number.isFinite(Number(c.opacity))?Number(c.opacity):1;
+        c.scale=Number.isFinite(Number(c.scale))?Number(c.scale):1;
+        c.x=Number.isFinite(Number(c.x))?Number(c.x):.5;
+        c.y=Number.isFinite(Number(c.y))?Number(c.y):.5;
+        c.rotation=Number(c.rotation)||0;
+      }
+      if(c.type==="subtitle" || c.type==="text"){
+        c.text=String(c.text??(c.type==="text"?"Text":""));
+        c.fontScale=Number.isFinite(Number(c.fontScale))?Number(c.fontScale):(c.type==="text"?.06:.045);
+        c.textWidth=Number.isFinite(Number(c.textWidth))?Number(c.textWidth):(c.type==="text"?.55:.86);
+        c.x=Number.isFinite(Number(c.x))?Number(c.x):.5;
+        c.y=Number.isFinite(Number(c.y))?Number(c.y):(c.type==="text"?.5:.90);
+        c.color=c.color||"#ffffff";
+        c.bgColor=c.bgColor||"#000000";
+        c.bgOpacity=clamp(Number(c.bgOpacity)||0,0,1);
+      }
+    }
+  }
+
+  if(!state.project.tracks.some(t=>t.type==="video")){
+    state.project.tracks.unshift({id:uid(),type:"video",name:"Video 1",clips:[]});
+  }
+  if(!state.project.tracks.some(t=>t.type==="audio")){
+    state.project.tracks.push({id:uid(),type:"audio",name:"Audio 1",clips:[]});
+  }
+  if(!state.project.tracks.some(t=>t.type==="subtitle")){
+    state.project.tracks.push({id:uid(),type:"subtitle",name:"Subtitles",clips:[]});
+  }
+}
+
+function bindSafe(el,event,handler){
+  if(!el) return false;
+  try{
+    if(event==="click") el.onclick=handler;
+    else if(event==="change") el.onchange=handler;
+    else if(event==="input") el.oninput=handler;
+    else el.addEventListener(event,handler);
+    return true;
+  }catch(err){
+    console.warn("Could not bind control",el?.id,event,err);
+    return false;
+  }
+}
+function bindId(id,event,handler){ return bindSafe(document.getElementById(id),event,handler); }
+
 function bind(){
-  els.fileInput.onchange=e=>importFiles([...e.target.files]);
-  ["dragenter","dragover"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{e.preventDefault();els.dropZone.classList.add("drag")}));
-  ["dragleave","drop"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{e.preventDefault();els.dropZone.classList.remove("drag")}));
-  els.dropZone.addEventListener("drop",e=>importFiles([...e.dataTransfer.files]));
-  els.playBtn.onclick=togglePlay; if(els.previewPlayBtn) els.previewPlayBtn.onclick=togglePlay; els.canvas.onclick=()=>{if(state.isPlaying) togglePlay();}; els.canvas.addEventListener("pointerdown",(e)=>startPreviewPositionDrag(e)); $("#rewindBtn").onclick=()=>seekBy(-5); $("#forwardBtn").onclick=()=>seekBy(5);
-  $("#splitBtn").onclick=splitSelected; $("#duplicateBtn").onclick=duplicateSelected; $("#deleteBtn").onclick=deleteSelected;
-  $("#detachAudioBtn").onclick=detachAudio; $("#reverseBtn").onclick=reverseSelected; $("#addSubtitleBtn").onclick=addSubtitle; $("#addTextBtn")?.addEventListener("click",addTextOverlay);
-  $("#addVideoTrackBtn").onclick=()=>addTrack("video"); $("#addAudioTrackBtn").onclick=()=>addTrack("audio");
-  $("#undoBtn").onclick=undo; $("#redoBtn").onclick=redo;
-  els.zoom.oninput=()=>{state.pixelsPerSecond=Number(els.zoom.value);renderRuler();renderTracks();};
-  if(els.fullscreenBtn) els.fullscreenBtn.onclick=toggleFullscreen;
+  bindSafe(els.fileInput,"change",e=>importFiles([...(e.target.files||[])]));
+  if(els.dropZone){
+    ["dragenter","dragover"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{
+      e.preventDefault(); els.dropZone.classList.add("drag");
+    }));
+    ["dragleave","drop"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{
+      e.preventDefault(); els.dropZone.classList.remove("drag");
+    }));
+    els.dropZone.addEventListener("drop",e=>importFiles([...(e.dataTransfer?.files||[])]));
+  }
+
+  bindSafe(els.playBtn,"click",togglePlay);
+  bindSafe(els.previewPlayBtn,"click",togglePlay);
+  bindSafe(els.canvas,"click",()=>{if(state.isPlaying) togglePlay();});
+  els.canvas?.addEventListener("pointerdown",startPreviewPositionDrag);
+
+  bindId("rewindBtn","click",()=>seekBy(-5));
+  bindId("forwardBtn","click",()=>seekBy(5));
+  bindId("splitBtn","click",splitSelected);
+  bindId("duplicateBtn","click",duplicateSelected);
+  bindId("deleteBtn","click",deleteSelected);
+  bindId("detachAudioBtn","click",detachAudio);
+  bindId("reverseBtn","click",reverseSelected);
+  bindId("addSubtitleBtn","click",addSubtitle);
+  bindId("addTextBtn","click",addTextOverlay);
+  bindId("addVideoTrackBtn","click",()=>addTrack("video"));
+  bindId("addAudioTrackBtn","click",()=>addTrack("audio"));
+  bindId("undoBtn","click",undo);
+  bindId("redoBtn","click",redo);
+
+  bindSafe(els.zoom,"input",()=>{
+    state.pixelsPerSecond=Number(els.zoom.value)||90;
+    renderRuler(); renderTracks();
+  });
+  bindSafe(els.fullscreenBtn,"click",toggleFullscreen);
+
   document.addEventListener("fullscreenchange",syncFullscreenButton);
   document.addEventListener("webkitfullscreenchange",syncFullscreenButton);
-  $("#saveSubtitleBtn").addEventListener("click",(e)=>{e.preventDefault();saveSubtitle();});
-  $("#backupBtn").onclick=()=>{renderBackupList();els.backupDialog.showModal();};
-  $("#closeBackupDialog").onclick=()=>els.backupDialog.close();
-  $("#createBackupNow").onclick=async()=>{await createBackup("manual");renderBackupList();};
-  $("#downloadProjectBtn").onclick=downloadJSON;
-  $("#projectFileInput").onchange=e=>e.target.files[0]&&importProjectFile(e.target.files[0]);
-  $("#settingsBtn").onclick=()=>{syncSettingsUI();els.settingsDialog.showModal();};
-  $("#closeSettingsDialog").onclick=()=>els.settingsDialog.close();
-  $("#saveSettingsBtn").onclick=saveSettings;
-  $("#backupIntervalSelect").onchange=updateBackupWindowText;
-  $("#exportBtn").onclick=()=>els.exportDialog.showModal();
-  $("#closeExportDialog").onclick=()=>els.exportDialog.close();
-  $("#startExportBtn").onclick=exportWebM;
+
+  bindId("saveSubtitleBtn","click",e=>{e.preventDefault();saveSubtitle();});
+  bindId("backupBtn","click",()=>{renderBackupList();els.backupDialog?.showModal?.();});
+  bindId("closeBackupDialog","click",()=>els.backupDialog?.close?.());
+  bindId("createBackupNow","click",async()=>{await createBackup("manual");renderBackupList();});
+  bindId("downloadProjectBtn","click",downloadJSON);
+  bindId("projectFileInput","change",e=>e.target.files?.[0]&&importProjectFile(e.target.files[0]));
+  bindId("settingsBtn","click",()=>{syncSettingsUI();els.settingsDialog?.showModal?.();});
+  bindId("closeSettingsDialog","click",()=>els.settingsDialog?.close?.());
+  bindId("saveSettingsBtn","click",saveSettings);
+  bindId("backupIntervalSelect","change",updateBackupWindowText);
+  bindId("exportBtn","click",()=>els.exportDialog?.showModal?.());
+  bindId("closeExportDialog","click",()=>els.exportDialog?.close?.());
+  bindId("startExportBtn","click",exportWebM);
+
   window.addEventListener("keydown",(e)=>{
     if(["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName)) return;
     if(e.code==="Space"){e.preventDefault();togglePlay();}
-    if(e.key==="Escape" && els.previewPanel?.classList.contains("fallback-fullscreen")){els.previewPanel.classList.remove("fallback-fullscreen");document.body.classList.remove("preview-fallback-fullscreen");syncFullscreenButton();}
+    if(e.key==="Escape" && els.previewPanel?.classList.contains("fallback-fullscreen")){
+      els.previewPanel.classList.remove("fallback-fullscreen");
+      document.body.classList.remove("preview-fallback-fullscreen");
+      syncFullscreenButton();
+    }
     if(e.key==="Delete"||e.key==="Backspace") deleteSelected();
-    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="z"){e.preventDefault();e.shiftKey?redo():undo();}
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="z"){
+      e.preventDefault(); e.shiftKey?redo():undo();
+    }
   });
-  window.addEventListener("resize",()=>renderPreview());
-  window.addEventListener("beforeunload",()=>createBackup("auto"));
+
+  window.addEventListener("resize",()=>{try{renderPreview();}catch(err){console.warn(err);}});
+  window.addEventListener("beforeunload",()=>{try{createBackup("auto");}catch{}});
 }
+
 async function init(){
-  installDurationStyles();
-  installMediaDragStyles();
-  installTextOverlayControls();
-  bind();
-  await restoreLatestSession();
-  syncSettingsUI(); scheduleAutosave(); renderAll();
-  setInterval(()=>{ if(!state.isPlaying && !state.isExporting) renderPreview(); },250);
+  try{installDurationStyles();}catch(err){console.warn(err);}
+  try{installMediaDragStyles();}catch(err){console.warn(err);}
+  try{installTextOverlayControls();}catch(err){console.warn(err);}
+  try{bind();}catch(err){showPocketCutError(err?.message||err);}
+
+  // Make the interface usable immediately, even if IndexedDB/backups fail.
+  try{
+    normalizeProjectState();
+    syncSettingsUI();
+    renderAll();
+  }catch(err){
+    showPocketCutError(err?.message||err);
+  }
+
+  try{
+    await restoreLatestSession();
+    normalizeProjectState();
+    syncSettingsUI();
+    renderAll();
+  }catch(err){
+    console.warn("Saved session could not be restored; starting with current project.",err);
+    showPocketCutError("A saved local session could not be restored. The editor is still usable.");
+  }
+
+  try{scheduleAutosave();}catch(err){console.warn(err);}
+
+  setInterval(()=>{
+    if(state.isPlaying || state.isExporting) return;
+    try{renderPreview();}catch(err){console.warn("Preview refresh failed",err);}
+  },250);
 }
-init();
+
+window.addEventListener("error",e=>{
+  if(e?.error) showPocketCutError(e.error.message||e.message);
+});
+window.addEventListener("unhandledrejection",e=>{
+  const msg=e?.reason?.message||String(e?.reason||"");
+  if(msg && !/play\(\)|user gesture|interact/i.test(msg)) console.warn("Unhandled PocketCut promise",e.reason);
+});
+
+init().catch(err=>showPocketCutError(err?.message||err));
 })();
