@@ -96,6 +96,9 @@ const state = {
   drag: null,
   raf: 0,
   lastTick: 0,
+  lastPreviewFrame: 0,
+  isExporting: false,
+  exportRenderLongSide: 0,
   autosaveTimer: null,
 };
 localStorage.setItem("pc-project-id",state.project.id);
@@ -110,7 +113,7 @@ const els = {
   backupDialog: $("#backupDialog"), settingsDialog: $("#settingsDialog"),
   exportDialog: $("#exportDialog")
 };
-const ctx = els.canvas.getContext("2d");
+const ctx = els.canvas.getContext("2d",{alpha:false,desynchronized:true}) || els.canvas.getContext("2d");
 
 function projectDuration(){
   let max=0;
@@ -182,9 +185,17 @@ function getAspect(){
   const [w,h]=state.project.aspect.split(":").map(Number);
   return w/h;
 }
+function preferredPreviewLongSide(){
+  if(state.exportRenderLongSide>0) return state.exportRenderLongSide;
+  const mobile=window.matchMedia?.("(max-width: 800px)")?.matches;
+  const memory=Number(navigator.deviceMemory)||0;
+  if(memory && memory<=2) return 420;
+  if(mobile) return 540;
+  return 720;
+}
 function configureCanvas(){
   const aspect=getAspect();
-  const long=1280;
+  const long=preferredPreviewLongSide();
   let width, height;
   if(aspect>=1){
     width=long;
@@ -193,7 +204,6 @@ function configureCanvas(){
     height=long;
     width=Math.round(long*aspect);
   }
-  // Changing canvas.width/height clears the canvas. Only resize when necessary.
   if(els.canvas.width!==width) els.canvas.width=width;
   if(els.canvas.height!==height) els.canvas.height=height;
 }
@@ -321,18 +331,21 @@ function syncPreviewPlayback(){
       el.volume=gain;
       el.muted=c.reverse || gain<=0;
 
-      if(state.isPlaying){
+      if(state.isPlaying || state.isExporting){
         if(c.reverse){
-          // Browsers cannot play media elements backwards. Seek the picture backwards;
-          // reverse audio is rendered correctly in export, but muted during reverse preview.
           if(!el.paused) el.pause();
           el.muted=true;
-          if(el.readyState>=1 && Math.abs((el.currentTime||0)-target)>.045){
+          if(el.readyState>=1 && Math.abs((el.currentTime||0)-target)>.025){
             try{el.currentTime=target;}catch{}
           }
-        }else if(el.paused){
-          const p=el.play();
-          if(p?.catch) p.catch(()=>{});
+        }else{
+          if(el.paused){
+            const p=el.play();
+            if(p?.catch) p.catch(()=>{});
+          }
+          if(el.readyState>=1 && Math.abs((el.currentTime||0)-target)>.20){
+            try{el.currentTime=target;}catch{}
+          }
         }
       }else if(!el.paused){
         el.pause();
@@ -909,8 +922,17 @@ function tick(ts){
   const dt=(ts-state.lastTick)/1000; state.lastTick=ts;
   state.currentTime+=dt;
   const dur=projectDuration();
-  if(state.currentTime>=dur){state.currentTime=dur;pause();}
-  renderPreview(); updatePlayhead(); updateTimeLabel();
+  if(state.currentTime>=dur){state.currentTime=dur;pause();return;}
+
+  const mobile=window.matchMedia?.("(max-width: 800px)")?.matches;
+  const targetFps=mobile?24:30;
+  const interval=1000/targetFps;
+  if(!state.lastPreviewFrame || ts-state.lastPreviewFrame>=interval){
+    state.lastPreviewFrame=ts;
+    renderPreview();
+    updatePlayhead();
+    updateTimeLabel();
+  }
   state.raf=requestAnimationFrame(tick);
 }
 function syncPlayButtons(){
@@ -934,6 +956,7 @@ function play(){
   if(state.currentTime>=projectDuration()) state.currentTime=0;
   state.isPlaying=true;
   state.lastTick=0;
+  state.lastPreviewFrame=0;
   syncPlayButtons();
   // Start media immediately from the user gesture so mobile browsers allow playback.
   syncPreviewPlayback();
@@ -1124,7 +1147,11 @@ async function exportWebM(){
   const q=Number($("#exportQuality").value), aspect=getAspect();
   const out=document.createElement("canvas");
   if(aspect>=1){out.width=Math.round(q*aspect);out.height=q;} else {out.width=q;out.height=Math.round(q/aspect);}
-  const octx=out.getContext("2d"), videoStream=out.captureStream(30);
+  const octx=out.getContext("2d",{alpha:false,desynchronized:true}) || out.getContext("2d");
+  const exportFps=30;
+  const videoStream=out.captureStream(exportFps);
+  const oldExportLongSide=state.exportRenderLongSide;
+  state.exportRenderLongSide=Math.max(out.width,out.height);
   const audioMix=await renderAudioMix(duration,status);
   let audioCtx=null,audioSource=null,audioDest=null;
   const combinedTracks=[...videoStream.getVideoTracks()];
@@ -1138,7 +1165,7 @@ async function exportWebM(){
   }
   const stream=new MediaStream(combinedTracks);
   const mime=["video/webm;codecs=vp9,opus","video/webm;codecs=vp8,opus","video/webm"].find(x=>MediaRecorder.isTypeSupported(x))||"video/webm";
-  const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:q>=1080?8_000_000:q>=720?5_000_000:2_500_000,audioBitsPerSecond:192_000});
+  const rec=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:q>=1080?12_000_000:q>=720?7_000_000:3_500_000,audioBitsPerSecond:192_000});
   const chunks=[]; rec.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
   const oldTime=state.currentTime, oldPlaying=state.isPlaying; pause();
   status.textContent="Rendering… keep this tab open.";
@@ -1146,22 +1173,71 @@ async function exportWebM(){
   rec.start(500);
   const lead=.12; if(audioSource) audioSource.start(audioCtx.currentTime+lead);
   await new Promise(r=>setTimeout(r,lead*1000));
-  const started=performance.now(); let lastFrame=-1;
+  state.isExporting=true;
+  state.lastPreviewFrame=0;
+  state.currentTime=0;
+  renderPreview();
+
+  const started=performance.now();
+  let nextFrame=started;
+
   while(true){
-    const elapsed=(performance.now()-started)/1000; if(elapsed>=duration) break;
-    const frame=Math.floor(elapsed*30);
-    if(frame!==lastFrame){
-      lastFrame=frame; state.currentTime=Math.min(duration,elapsed);
-      await syncVideoFramesForTime(state.currentTime);
+    const now=performance.now();
+    const elapsed=(now-started)/1000;
+    if(elapsed>=duration) break;
+
+    if(now>=nextFrame){
+      state.currentTime=Math.min(duration,elapsed);
+
+      // Only reversed clips need frame-accurate seeking.
+      const reverseJobs=[];
+      for(const track of state.project.tracks){
+        if(!(track.type==="video" || track.type==="overlay")) continue;
+        for(const c of track.clips){
+          if(!c.reverse || c.type!=="video" || !clipIsActive(c,state.currentTime)) continue;
+          const media=mediaById(c.mediaId);
+          const runtime=media && createClipRuntime(c,media);
+          const el=runtime?.el;
+          if(!el || el.readyState<1) continue;
+          const target=clamp(clipLocalTime(c,state.currentTime),0,Math.max(0,(media.duration||0)-.01));
+          if(Math.abs((el.currentTime||0)-target)>.018){
+            reverseJobs.push(new Promise(resolve=>{
+              let finished=false;
+              const done=()=>{if(finished)return;finished=true;el.removeEventListener("seeked",done);resolve();};
+              el.addEventListener("seeked",done,{once:true});
+              try{el.currentTime=target;}catch{done();}
+              setTimeout(done,100);
+            }));
+          }
+        }
+      }
+      if(reverseJobs.length) await Promise.all(reverseJobs);
+
       renderPreview();
-      octx.clearRect(0,0,out.width,out.height); octx.drawImage(els.canvas,0,0,out.width,out.height);
-      if(frame%30===0) status.textContent=`Rendering ${Math.min(99,Math.round(elapsed/duration*100))}%`;
+      octx.clearRect(0,0,out.width,out.height);
+      octx.drawImage(els.canvas,0,0,out.width,out.height);
+
+      const frame=Math.floor(elapsed*exportFps);
+      if(frame%exportFps===0){
+        status.textContent=`Rendering ${Math.min(99,Math.round(elapsed/duration*100))}%`;
+      }
+
+      nextFrame += 1000/exportFps;
+      if(nextFrame < now-(1000/exportFps)) nextFrame=now;
     }
-    await new Promise(requestAnimationFrame);
+
+    const delay=Math.max(0,Math.min(8,nextFrame-performance.now()));
+    await new Promise(r=>setTimeout(r,delay));
   }
-  state.currentTime=duration; renderPreview(); octx.drawImage(els.canvas,0,0,out.width,out.height);
+
+  state.currentTime=duration;
+  renderPreview();
+  octx.drawImage(els.canvas,0,0,out.width,out.height);
   await new Promise(r=>setTimeout(r,120)); rec.stop();
   await new Promise(resolve=>rec.onstop=resolve);
+  state.isExporting=false;
+  pausePreviewPlayback();
+  state.exportRenderLongSide=oldExportLongSide;
   if(audioSource){try{audioSource.stop()}catch{}} if(audioCtx){try{await audioCtx.close()}catch{}}
   const blob=new Blob(chunks,{type:"video/webm"});
   const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
