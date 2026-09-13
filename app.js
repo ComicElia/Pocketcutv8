@@ -242,6 +242,35 @@ function clipLocalTime(c,t){
 }
 function clipIsActive(c,t){ return t>=c.start && t<c.start+c.duration; }
 
+
+function maxClipDuration(c){
+  if(c.type==="image" || c.type==="subtitle") return 24*60*60;
+  const media=mediaById(c.mediaId);
+  if(!media || !Number.isFinite(media.duration)) return 24*60*60;
+  const remaining=Math.max(0,media.duration-(Number(c.trimIn)||0));
+  return Math.max(.05,remaining/clipSpeed(c));
+}
+function setClipDuration(c,newDuration){
+  const oldDuration=Math.max(.05,Number(c.duration)||.05);
+  const limit=maxClipDuration(c);
+  newDuration=clamp(Number(newDuration)||oldDuration,.05,limit);
+  c.duration=newDuration;
+
+  c.fadeIn=Math.min(Number(c.fadeIn)||0,newDuration);
+  c.fadeOut=Math.min(Number(c.fadeOut)||0,newDuration);
+
+  if(Array.isArray(c.keyframes)){
+    for(const k of c.keyframes){
+      k.time=clamp(Number(k.time)||0,0,newDuration);
+    }
+    c.keyframes.sort((a,b)=>a.time-b.time);
+  }
+
+  if(state.currentTime>c.start+c.duration){
+    state.currentTime=c.start+c.duration;
+  }
+}
+
 function setClipSpeed(c,newSpeed){
   const oldSpeed=clipSpeed(c);
   newSpeed=clamp(Number(newSpeed)||1,.25,100);
@@ -580,6 +609,11 @@ function renderTracks(){
           div.appendChild(marker);
         }
       }
+      const resizeHandle=document.createElement("span");
+      resizeHandle.className="clip-resize-handle";
+      resizeHandle.title=c.type==="image"?"Drag to change how long this image stays on screen":"Drag to change clip duration";
+      resizeHandle.addEventListener("pointerdown",(e)=>startClipResize(e,c,track));
+      div.appendChild(resizeHandle);
       div.addEventListener("pointerdown",(e)=>startClipDrag(e,c,track));
       div.addEventListener("click",(e)=>{e.stopPropagation();state.selectedClipId=c.id;renderAll();});
       row.appendChild(div);
@@ -628,14 +662,38 @@ function renderInspector(){
       const value=type==="number"?Number(input.value):input.value;
       if(key==="speed"){
         setClipSpeed(c,value);
+      }else if(key==="duration"){
+        setClipDuration(c,value);
       }else if(visualNow && VISUAL_KEYS.includes(key) && (c.keyframes||[]).length && state.currentTime>=c.start && state.currentTime<=c.start+c.duration){
         upsertKeyframe(c,state.currentTime-c.start,{[key]:value});
       }else c[key]=value;
-      if(key==="duration") c.duration=Math.max(.1,c.duration);
       renderAll();
     };
     lab.appendChild(input); els.inspector.appendChild(lab);
   }
+  if(c.type==="image"){
+    const durationTools=document.createElement("div");
+    durationTools.className="duration-tools";
+
+    const minus=document.createElement("button");
+    minus.type="button";
+    minus.textContent="−1s";
+    minus.onclick=()=>{commitHistory();setClipDuration(c,c.duration-1);renderAll();};
+
+    const plus=document.createElement("button");
+    plus.type="button";
+    plus.textContent="+1s";
+    plus.onclick=()=>{commitHistory();setClipDuration(c,c.duration+1);renderAll();};
+
+    const plusFive=document.createElement("button");
+    plusFive.type="button";
+    plusFive.textContent="+5s";
+    plusFive.onclick=()=>{commitHistory();setClipDuration(c,c.duration+5);renderAll();};
+
+    durationTools.append(minus,plus,plusFive);
+    els.inspector.appendChild(durationTools);
+  }
+
   if(c.type==="video"||c.type==="image") renderKeyframeEditor(c);
 }
 function renderKeyframeEditor(c){
@@ -869,6 +927,38 @@ function onTimelinePointerDown(e,track){
   state.currentTime=clamp(x/state.pixelsPerSecond,0,projectDuration()+10);
   renderAll();
 }
+
+function startClipResize(e,c,track){
+  e.preventDefault();
+  e.stopPropagation();
+  state.selectedClipId=c.id;
+  commitHistory();
+
+  const startX=e.clientX;
+  const originalDuration=Math.max(.05,Number(c.duration)||.05);
+  e.currentTarget.setPointerCapture?.(e.pointerId);
+
+  const move=(ev)=>{
+    const dx=ev.clientX-startX;
+    const proposed=originalDuration + dx/state.pixelsPerSecond;
+    setClipDuration(c,proposed);
+    renderRuler();
+    renderTracks();
+    renderInspector();
+    renderPreview();
+    updateTimeLabel();
+  };
+
+  const up=()=>{
+    window.removeEventListener("pointermove",move);
+    window.removeEventListener("pointerup",up);
+    renderAll();
+  };
+
+  window.addEventListener("pointermove",move);
+  window.addEventListener("pointerup",up);
+}
+
 function startClipDrag(e,c,track){
   e.stopPropagation();
   state.selectedClipId=c.id;
@@ -1327,6 +1417,49 @@ async function toggleFullscreen(){
   syncFullscreenButton();
 }
 
+
+function installDurationStyles(){
+  if(document.getElementById("pc-duration-styles")) return;
+  const style=document.createElement("style");
+  style.id="pc-duration-styles";
+  style.textContent=`
+    .clip-resize-handle{
+      position:absolute;
+      top:0;
+      right:0;
+      width:14px;
+      height:100%;
+      cursor:ew-resize;
+      touch-action:none;
+      z-index:9;
+    }
+    .clip-resize-handle::after{
+      content:"";
+      position:absolute;
+      right:3px;
+      top:8px;
+      bottom:8px;
+      width:3px;
+      border-radius:3px;
+      background:rgba(255,255,255,.78);
+    }
+    .duration-tools{
+      grid-column:1/-1;
+      display:flex;
+      gap:7px;
+      flex-wrap:wrap;
+    }
+    .duration-tools button{
+      min-width:64px;
+    }
+    @media(max-width:640px){
+      .clip-resize-handle{width:20px}
+      .clip-resize-handle::after{right:5px;width:4px}
+    }
+  `;
+  document.head.appendChild(style);
+}
+
 function bind(){
   els.fileInput.onchange=e=>importFiles([...e.target.files]);
   ["dragenter","dragover"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{e.preventDefault();els.dropZone.classList.add("drag")}));
@@ -1365,6 +1498,7 @@ function bind(){
   window.addEventListener("beforeunload",()=>createBackup("auto"));
 }
 async function init(){
+  installDurationStyles();
   bind();
   await restoreLatestSession();
   syncSettingsUI(); scheduleAutosave(); renderAll();
