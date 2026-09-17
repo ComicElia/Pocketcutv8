@@ -41,8 +41,8 @@
           <button id="forwardBtn" title="Forward 5 seconds">+5s</button>
           <span id="timeLabel" class="time-label">00:00.0 / 00:00.0</span>
           <button id="fullscreenBtn" class="fullscreen-btn" type="button" title="Fullscreen preview">⛶ Fullscreen</button>
-          <label class="zoom-control">Zoom
-            <input id="zoomRange" type="range" min="40" max="180" value="90" />
+          <label class="zoom-control">Timeline zoom
+            <input id="zoomRange" type="range" min="0.25" max="320" step="0.25" value="90" />
           </label>
         </div>
       </section>
@@ -67,6 +67,7 @@
           <button id="splitBtn">Split</button>
           <button id="duplicateBtn">Duplicate</button>
           <button id="deleteBtn">Delete</button>
+          <button id="closeGapBtn" title="Close the selected video/audio gap">Close gap</button>
           <button id="detachAudioBtn">Detach audio</button>
           <button id="reverseBtn">Reverse</button>
           <button id="addSubtitleBtn">Subtitle</button>
@@ -75,6 +76,12 @@
           <button id="addAudioTrackBtn">+ Audio track</button>
           <button id="undoBtn">Undo</button>
           <button id="redoBtn">Redo</button>
+          <span class="timeline-zoom-tools" aria-label="Timeline zoom controls">
+            <button id="timelineZoomOutBtn" type="button" title="Zoom timeline out">−</button>
+            <button id="timelineZoomInBtn" type="button" title="Zoom timeline in">+</button>
+            <button id="timelineFitBtn" type="button" title="Fit all timeline media">Fit</button>
+            <span id="timelineZoomLabel" class="timeline-zoom-label">90 px/s</span>
+          </span>
         </div>
 
         <div class="timeline-shell">
