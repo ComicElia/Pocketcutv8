@@ -116,6 +116,7 @@ const state = {
   clipRuntime: new Map(),
   selectedClipId: null,
   selectedGap: null,
+  clipClipboard: null,
   currentTime: 0,
   isPlaying: false,
   pixelsPerSecond: 90,
@@ -1422,6 +1423,47 @@ function splitSelected(){
   }
   track.clips.push(right); state.selectedClipId=right.id; state.selectedGap=null; renderAll();
 }
+function copySelectedClip(){
+  const sel=selectedClip();
+  if(!sel) return false;
+  state.clipClipboard={
+    clip:deepClone(sel.clip),
+    sourceTrackId:sel.track.id,
+    sourceTrackType:sel.track.type,
+    copiedAt:Date.now()
+  };
+  return true;
+}
+function pasteCopiedClip(){
+  const payload=state.clipClipboard;
+  if(!payload?.clip) return false;
+
+  // Keep the copy self-contained, but never reuse a live clip id/runtime.
+  const copy=deepClone(payload.clip);
+  copy.id=uid();
+  copy.start=Math.max(0,Number(state.currentTime)||0);
+
+  // Prefer the exact source track. If it was deleted, use a compatible track.
+  let track=state.project.tracks.find(t=>t.id===payload.sourceTrackId);
+  if(!track || track.type!==payload.sourceTrackType){
+    track=state.project.tracks.find(t=>t.type===payload.sourceTrackType);
+  }
+  if(!track){
+    const type=payload.sourceTrackType || copy.type || "video";
+    const count=state.project.tracks.filter(t=>t.type===type).length+1;
+    track={id:uid(),type,name:`${type[0].toUpperCase()+type.slice(1)} ${count}`,clips:[]};
+    state.project.tracks.push(track);
+  }
+
+  commitHistory();
+  track.clips.push(copy);
+  track.clips.sort((a,b)=>(Number(a.start)||0)-(Number(b.start)||0));
+  state.selectedClipId=copy.id;
+  state.selectedGap=null;
+  disposeClipRuntime(copy.id);
+  renderAll();
+  return true;
+}
 function duplicateSelected(){
   const sel=selectedClip(); if(!sel) return;
   commitHistory();
@@ -2275,6 +2317,12 @@ function bind(){
     if(!e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase()==="s"){e.preventDefault();splitSelected();}
     if(e.key==="Escape" && els.previewPanel?.classList.contains("fallback-fullscreen")){els.previewPanel.classList.remove("fallback-fullscreen");document.body.classList.remove("preview-fallback-fullscreen");syncFullscreenButton();}
     if(e.key==="Delete"||e.key==="Backspace") deleteSelected();
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="c" && !e.shiftKey && !e.altKey){
+      if(selectedClip()){e.preventDefault();copySelectedClip();}
+    }
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="v" && !e.shiftKey && !e.altKey){
+      if(state.clipClipboard?.clip){e.preventDefault();pasteCopiedClip();}
+    }
     if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="z"){e.preventDefault();e.shiftKey?redo():undo();}
   });
   window.addEventListener("resize",()=>{renderPreview();renderRuler();renderTracks();});
