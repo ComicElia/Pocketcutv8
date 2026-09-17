@@ -876,6 +876,65 @@ function closeSelectedGap(){
   return true;
 }
 
+// Timeline snapping. A small screen-space threshold keeps snapping predictable at every zoom level.
+const SNAP_PX=10;
+function snapThresholdSeconds(){
+  return clamp(SNAP_PX/Math.max(.01,state.pixelsPerSecond),.025,.45);
+}
+function snapCandidates(excludeClipId=null){
+  const out=[0,state.currentTime];
+  for(const track of state.project.tracks){
+    for(const clip of track.clips){
+      if(clip.id===excludeClipId) continue;
+      const start=Math.max(0,Number(clip.start)||0);
+      const end=start+Math.max(0,Number(clip.duration)||0);
+      out.push(start,end);
+    }
+  }
+  return out;
+}
+function nearestSnap(value,candidates,threshold=snapThresholdSeconds()){
+  let best=null,dist=Infinity;
+  for(const t of candidates){
+    const d=Math.abs(value-t);
+    if(d<=threshold && d<dist){best=t;dist=d;}
+  }
+  return best;
+}
+function snapDraggedClip(proposedStart,clip,disableSnap=false){
+  proposedStart=Math.max(0,proposedStart);
+  if(disableSnap) return {start:proposedStart,snapTime:null};
+  const duration=Math.max(0,Number(clip.duration)||0);
+  const candidates=snapCandidates(clip.id);
+  const left=nearestSnap(proposedStart,candidates);
+  const right=nearestSnap(proposedStart+duration,candidates);
+  if(left==null && right==null) return {start:proposedStart,snapTime:null};
+  const leftDelta=left==null?Infinity:Math.abs(left-proposedStart);
+  const rightDelta=right==null?Infinity:Math.abs(right-(proposedStart+duration));
+  if(leftDelta<=rightDelta) return {start:Math.max(0,left),snapTime:left};
+  return {start:Math.max(0,right-duration),snapTime:right};
+}
+function snapClipEnd(proposedEnd,clip,disableSnap=false){
+  proposedEnd=Math.max((Number(clip.start)||0)+.05,proposedEnd);
+  if(disableSnap) return {end:proposedEnd,snapTime:null};
+  const snapped=nearestSnap(proposedEnd,snapCandidates(clip.id));
+  return {end:snapped==null?proposedEnd:snapped,snapTime:snapped};
+}
+function showSnapGuide(time){
+  let guide=document.getElementById("pcSnapGuide");
+  if(time==null){if(guide) guide.style.display="none";return;}
+  if(!guide){
+    guide=document.createElement("div");
+    guide.id="pcSnapGuide";
+    guide.setAttribute("aria-hidden","true");
+    Object.assign(guide.style,{position:"absolute",top:"32px",bottom:"0",width:"1px",background:"#7c9cff",boxShadow:"0 0 0 1px rgba(124,156,255,.22)",zIndex:"29",pointerEvents:"none",display:"none"});
+    els.timelineMain?.appendChild(guide);
+  }
+  guide.style.left=(time*state.pixelsPerSecond)+"px";
+  guide.style.display="block";
+}
+function hideSnapGuide(){showSnapGuide(null);}
+
 function renderRuler(){
   const width=timelineWidth(); els.ruler.style.width=width+"px";
   els.ruler.innerHTML="";
@@ -934,8 +993,11 @@ function renderTracks(){
       if(g.duration*state.pixelsPerSecond>52){
         const label=document.createElement("span"); label.className="timeline-gap-label"; label.textContent=`Gap ${fmt(g.duration)}`; gap.appendChild(label);
       }
-      gap.addEventListener("pointerdown",e=>e.stopPropagation());
-      gap.addEventListener("click",e=>{e.stopPropagation();selectGap(g);});
+      gap.addEventListener("pointerdown",e=>{
+        e.preventDefault();
+        e.stopPropagation();
+        selectGap(g);
+      });
       row.appendChild(gap);
     }
     for(const c of track.clips){
@@ -1333,11 +1395,20 @@ function saveSubtitle(){
 }
 
 function onTimelinePointerDown(e,track){
-  if(e.target.closest(".clip,.timeline-gap")) return;
-  state.selectedGap=null;
+  if(e.target.closest(".clip")) return;
   const rect=e.currentTarget.getBoundingClientRect();
   const x=e.clientX-rect.left+e.currentTarget.parentElement.scrollLeft;
-  state.currentTime=clamp(x/state.pixelsPerSecond,0,projectDuration()+10);
+  const time=clamp(x/state.pixelsPerSecond,0,projectDuration()+10);
+
+  // Select a real empty video/audio region even when the visual gap overlay misses a touch.
+  if(["video","audio"].includes(track.type)){
+    const tolerance=Math.min(.08,6/Math.max(1,state.pixelsPerSecond));
+    const gap=computeTrackGaps(track).find(g=>time>=g.start-tolerance && time<=g.end+tolerance);
+    if(gap){selectGap(gap);return;}
+  }
+
+  state.selectedGap=null;
+  state.currentTime=time;
   renderAll();
 }
 
@@ -1354,16 +1425,19 @@ function startClipResize(e,c,track){
 
   const move=(ev)=>{
     const dx=ev.clientX-startX;
-    const proposed=originalDuration + dx/state.pixelsPerSecond;
-    setClipDuration(c,proposed);
+    const proposedEnd=(Number(c.start)||0)+originalDuration+dx/state.pixelsPerSecond;
+    const snapped=snapClipEnd(proposedEnd,c,ev.altKey);
+    setClipDuration(c,snapped.end-(Number(c.start)||0));
     renderRuler();
     renderTracks();
+    showSnapGuide(snapped.snapTime);
     renderInspector();
     renderPreview();
     updateTimeLabel();
   };
 
   const up=()=>{
+    hideSnapGuide();
     window.removeEventListener("pointermove",move);
     window.removeEventListener("pointerup",up);
     renderAll();
@@ -1392,9 +1466,12 @@ function startClipDrag(e,c,track){
   const move=(ev)=>{
     if(!state.drag) return;
     const dx=ev.clientX-state.drag.startX;
-    c.start=Math.max(0,state.drag.origStart+dx/state.pixelsPerSecond);
+    const proposed=Math.max(0,state.drag.origStart+dx/state.pixelsPerSecond);
+    const snapped=snapDraggedClip(proposed,c,ev.altKey);
+    c.start=snapped.start;
     renderRuler();
     renderTracks();
+    showSnapGuide(snapped.snapTime);
     renderPreview();
     updateTimeLabel();
 
@@ -1405,6 +1482,7 @@ function startClipDrag(e,c,track){
   };
 
   const up=(ev)=>{
+    hideSnapGuide();
     document.querySelectorAll(".track-row.track-drop-target").forEach(x=>x.classList.remove("track-drop-target"));
     const row=document.elementFromPoint(ev.clientX,ev.clientY)?.closest?.(".track-row");
     const target=row && state.project.tracks.find(t=>t.id===row.dataset.trackId);
