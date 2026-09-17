@@ -860,16 +860,64 @@ function selectGap(g){
   renderAll();
 }
 function closeSelectedGap(){
-  const gap=state.selectedGap; if(!gap) return false;
-  const track=state.project.tracks.find(t=>t.id===gap.trackId); if(!track) return false;
-  const current=computeTrackGaps(track).find(g=>Math.abs(g.start-gap.start)<.03 && Math.abs(g.end-gap.end)<.03)
-    || computeTrackGaps(track).find(g=>state.currentTime>=g.start-.02 && state.currentTime<=g.end+.02);
-  if(!current || current.duration<=.025){state.selectedGap=null;renderAll();return false;}
-  commitHistory();
-  const shift=current.duration;
-  for(const c of track.clips){
-    if(c.start>=current.end-.02) c.start=Math.max(0,c.start-shift);
+  const selected=state.selectedGap;
+  if(!selected) return false;
+  const track=state.project.tracks.find(t=>t.id===selected.trackId);
+  if(!track) return false;
+
+  // Re-resolve the selected gap from the live clip layout. Do not use the playhead as a
+  // fallback: it can sit close to another boundary after edits/rounding and close the
+  // wrong amount.
+  const gaps=computeTrackGaps(track);
+  let current=gaps.find(g=>Math.abs(g.start-selected.start)<.03 && Math.abs(g.end-selected.end)<.03);
+  if(!current){
+    current=gaps
+      .map(g=>({g,score:Math.abs(g.start-selected.start)+Math.abs(g.end-selected.end)}))
+      .sort((a,b)=>a.score-b.score)[0]?.g || null;
   }
+  if(!current || current.duration<=.025){
+    state.selectedGap=null;
+    renderAll();
+    return false;
+  }
+
+  // Find the first clip after this gap and derive the ripple delta from its REAL start.
+  // This guarantees that the next clip lands exactly on current.start. Clip duration,
+  // trimIn, speed and keyframes are never modified by closing a gap.
+  const later=track.clips
+    .filter(c=>(Number(c.duration)||0)>0 && (Number(c.start)||0)>=current.end-.02)
+    .sort((a,b)=>(Number(a.start)||0)-(Number(b.start)||0));
+  if(!later.length){
+    state.selectedGap=null;
+    renderAll();
+    return false;
+  }
+
+  const firstStart=Math.max(0,Number(later[0].start)||0);
+  const shift=firstStart-current.start;
+  if(shift<=.025){
+    state.selectedGap=null;
+    renderAll();
+    return false;
+  }
+
+  commitHistory();
+  const cutoff=firstStart-.02;
+  for(const c of track.clips){
+    const start=Math.max(0,Number(c.start)||0);
+    if(start>=cutoff) c.start=Math.max(0,start-shift);
+  }
+
+  // Eliminate tiny floating-point residue so the gap is genuinely zero-width.
+  const movedFirst=later[0];
+  const residue=(Number(movedFirst.start)||0)-current.start;
+  if(Math.abs(residue)>.000001){
+    const movedCutoff=current.start-.001;
+    for(const c of track.clips){
+      if((Number(c.start)||0)>=movedCutoff) c.start=Math.max(0,(Number(c.start)||0)-residue);
+    }
+  }
+
   state.currentTime=current.start;
   state.selectedGap=null;
   renderAll();
