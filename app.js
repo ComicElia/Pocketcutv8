@@ -837,27 +837,77 @@ function fitTimeline(){
 }
 function computeTrackGaps(track){
   if(!track || !["video","audio"].includes(track.type)) return [];
-  const clips=track.clips.slice().filter(c=>Number(c.duration)>0).sort((a,b)=>a.start-b.start);
+  const clips=track.clips
+    .slice()
+    .filter(c=>Number(c.duration)>0)
+    .sort((a,b)=>(Number(a.start)||0)-(Number(b.start)||0));
   if(!clips.length) return [];
+
   const gaps=[];
   let coveredEnd=0;
+  let coveringClipId=null;
+
   for(const c of clips){
     const start=Math.max(0,Number(c.start)||0);
     const end=Math.max(start,start+(Number(c.duration)||0));
-    if(start-coveredEnd>.025) gaps.push({trackId:track.id,start:coveredEnd,end,duration:start-coveredEnd});
-    coveredEnd=Math.max(coveredEnd,end);
+
+    if(start-coveredEnd>.025){
+      gaps.push({
+        trackId:track.id,
+        start:coveredEnd,
+        end:start,
+        duration:start-coveredEnd,
+        beforeClipId:coveringClipId,
+        afterClipId:c.id
+      });
+    }
+
+    if(end>coveredEnd+.000001){
+      coveredEnd=end;
+      coveringClipId=c.id;
+    }
   }
   return gaps;
 }
 function selectedGapIsCurrent(g){
   const s=state.selectedGap;
-  return !!s && s.trackId===g.trackId && Math.abs(s.start-g.start)<.02 && Math.abs(s.end-g.end)<.02;
+  if(!s || s.trackId!==g.trackId) return false;
+  if(s.afterClipId && g.afterClipId) return s.afterClipId===g.afterClipId && s.beforeClipId===g.beforeClipId;
+  return Math.abs(s.start-g.start)<.02 && Math.abs(s.end-g.end)<.02;
 }
 function selectGap(g){
   state.selectedClipId=null;
-  state.selectedGap={trackId:g.trackId,start:g.start,end:g.end};
+  state.selectedGap={
+    trackId:g.trackId,
+    start:g.start,
+    end:g.end,
+    beforeClipId:g.beforeClipId||null,
+    afterClipId:g.afterClipId||null
+  };
   state.currentTime=g.start;
   renderAll();
+}
+function gapIntegritySnapshot(track){
+  return track.clips.map(c=>({
+    id:c.id,
+    duration:Number(c.duration)||0,
+    trimIn:Number(c.trimIn)||0,
+    speed:Number(c.speed)||1,
+    mediaId:c.mediaId??null,
+    type:c.type,
+    reverse:!!c.reverse,
+    keyframes:JSON.stringify(c.keyframes||[])
+  })).sort((a,b)=>String(a.id).localeCompare(String(b.id)));
+}
+function sameGapIntegrity(a,b){
+  if(a.length!==b.length) return false;
+  for(let i=0;i<a.length;i++){
+    const x=a[i], y=b[i];
+    if(x.id!==y.id || Math.abs(x.duration-y.duration)>.000001 || Math.abs(x.trimIn-y.trimIn)>.000001 ||
+       Math.abs(x.speed-y.speed)>.000001 || x.mediaId!==y.mediaId || x.type!==y.type ||
+       x.reverse!==y.reverse || x.keyframes!==y.keyframes) return false;
+  }
+  return true;
 }
 function closeSelectedGap(){
   const selected=state.selectedGap;
@@ -865,60 +915,71 @@ function closeSelectedGap(){
   const track=state.project.tracks.find(t=>t.id===selected.trackId);
   if(!track) return false;
 
-  // Re-resolve the selected gap from the live clip layout. Do not use the playhead as a
-  // fallback: it can sit close to another boundary after edits/rounding and close the
-  // wrong amount.
+  // Re-resolve by clip identity, never by "nearest" timestamps. If the gap changed
+  // since it was selected, do nothing rather than risk moving the wrong footage.
   const gaps=computeTrackGaps(track);
-  let current=gaps.find(g=>Math.abs(g.start-selected.start)<.03 && Math.abs(g.end-selected.end)<.03);
+  let current=null;
+  if(selected.afterClipId){
+    current=gaps.find(g=>g.afterClipId===selected.afterClipId && g.beforeClipId===selected.beforeClipId) || null;
+  }
   if(!current){
-    current=gaps
-      .map(g=>({g,score:Math.abs(g.start-selected.start)+Math.abs(g.end-selected.end)}))
-      .sort((a,b)=>a.score-b.score)[0]?.g || null;
+    current=gaps.find(g=>Math.abs(g.start-selected.start)<.01 && Math.abs(g.end-selected.end)<.01) || null;
   }
-  if(!current || current.duration<=.025){
+  if(!current || current.duration<=.025 || !current.afterClipId){
     state.selectedGap=null;
     renderAll();
     return false;
   }
 
-  // Find the first clip after this gap and derive the ripple delta from its REAL start.
-  // This guarantees that the next clip lands exactly on current.start. Clip duration,
-  // trimIn, speed and keyframes are never modified by closing a gap.
-  const later=track.clips
-    .filter(c=>(Number(c.duration)||0)>0 && (Number(c.start)||0)>=current.end-.02)
-    .sort((a,b)=>(Number(a.start)||0)-(Number(b.start)||0));
-  if(!later.length){
+  const after=track.clips.find(c=>c.id===current.afterClipId);
+  if(!after){
     state.selectedGap=null;
     renderAll();
     return false;
   }
 
-  const firstStart=Math.max(0,Number(later[0].start)||0);
-  const shift=firstStart-current.start;
+  const afterStart=Math.max(0,Number(after.start)||0);
+  const targetStart=Math.max(0,Number(current.start)||0);
+  const shift=afterStart-targetStart;
   if(shift<=.025){
     state.selectedGap=null;
     renderAll();
     return false;
   }
 
+  // Snapshot everything that MUST NOT change. Close-gap is start-time-only.
+  const integrityBefore=gapIntegritySnapshot(track);
+  const startsBefore=new Map(track.clips.map(c=>[c.id,Number(c.start)||0]));
+  const historyBefore=state.history.length;
   commitHistory();
-  const cutoff=firstStart-.02;
+
+  // Move the selected gap's following clip and every later-starting clip on THIS
+  // track left by exactly the live gap width. We deliberately do not call trim,
+  // split, delete, duration, speed, or media functions here.
+  const cutoff=afterStart-.000001;
   for(const c of track.clips){
-    const start=Math.max(0,Number(c.start)||0);
-    if(start>=cutoff) c.start=Math.max(0,start-shift);
+    const oldStart=startsBefore.get(c.id)??0;
+    if(oldStart>=cutoff) c.start=Math.max(0,oldStart-shift);
   }
 
-  // Eliminate tiny floating-point residue so the gap is genuinely zero-width.
-  const movedFirst=later[0];
-  const residue=(Number(movedFirst.start)||0)-current.start;
-  if(Math.abs(residue)>.000001){
-    const movedCutoff=current.start-.001;
+  const integrityAfter=gapIntegritySnapshot(track);
+  if(!sameGapIntegrity(integrityBefore,integrityAfter)){
+    // Safety rollback. Restore starts and discard this history entry because the
+    // operation is not allowed to mutate/delete/trim any clip.
     for(const c of track.clips){
-      if((Number(c.start)||0)>=movedCutoff) c.start=Math.max(0,(Number(c.start)||0)-residue);
+      if(startsBefore.has(c.id)) c.start=startsBefore.get(c.id);
     }
+    while(state.history.length>historyBefore) state.history.pop();
+    state.selectedGap=null;
+    renderAll();
+    console.error("Close gap aborted: clip integrity check failed.");
+    return false;
   }
 
-  state.currentTime=current.start;
+  // Final geometric validation: the selected gap must now be closed and the
+  // following clip must begin exactly at the previous occupied boundary.
+  after.start=targetStart;
+  state.currentTime=targetStart;
   state.selectedGap=null;
   renderAll();
   return true;
