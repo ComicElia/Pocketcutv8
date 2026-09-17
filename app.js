@@ -115,6 +115,7 @@ const state = {
   mediaRuntime: new Map(),
   clipRuntime: new Map(),
   selectedClipId: null,
+  selectedGap: null,
   currentTime: 0,
   isPlaying: false,
   pixelsPerSecond: 90,
@@ -124,6 +125,8 @@ const state = {
   raf: 0,
   lastTick: 0,
   lastPreviewFrame: 0,
+  previewFrameCallback: null,
+  previewFrameVideo: null,
   isExporting: false,
   exportRenderLongSide: 0,
   autosaveTimer: null,
@@ -133,7 +136,8 @@ safeLocalSet("pc-project-id",state.project.id);
 const els = {
   canvas: $("#previewCanvas"), emptyPreview: $("#emptyPreview"), playBtn: $("#playBtn"), previewPlayBtn: $("#previewPlayBtn"), previewPanel: $("#previewPanel"),
   timeLabel: $("#timeLabel"), tracks: $("#tracks"), trackHeaders: $("#trackHeaders"),
-  ruler: $("#ruler"), playhead: $("#playhead"), mediaBin: $("#mediaBin"),
+  ruler: $("#ruler"), playhead: $("#playhead"), mediaBin: $("#mediaBin"), timelineMain: document.querySelector(".timeline-main"),
+  timelineZoomLabel: $("#timelineZoomLabel"),
   fileInput: $("#fileInput"), dropZone: $("#dropZone"), inspector: $("#inspectorBody"),
   inspectorHint: $("#inspectorHint"), projectNameLabel: $("#projectNameLabel"),
   zoom: $("#zoomRange"), fullscreenBtn: $("#fullscreenBtn"), previewStage: $("#previewStage"), subtitleDialog: $("#subtitleDialog"),
@@ -201,6 +205,7 @@ function applyProjectData(data){
   state.project=data.project;
   state.media = Array.isArray(data.media)?data.media:[];
   state.selectedClipId=null;
+  state.selectedGap=null;
   state.currentTime=0;
   safeLocalSet("pc-project-id",state.project.id);
   loadMediaFromDB().then(renderAll);
@@ -356,6 +361,44 @@ function previewGain(c,t){
   if(fadeOut>0) gain*=clamp((c.duration-local)/fadeOut,0,1);
   return clamp(gain,0,1);
 }
+function cancelPreviewFrameCallback(){
+  const el=state.previewFrameVideo;
+  const id=state.previewFrameCallback;
+  if(el && id!=null && typeof el.cancelVideoFrameCallback==="function"){
+    try{el.cancelVideoFrameCallback(id);}catch{}
+  }
+  state.previewFrameCallback=null;
+  state.previewFrameVideo=null;
+}
+function activePreviewVideoElement(){
+  let found=null;
+  for(const track of state.project.tracks){
+    if(!(track.type==="video" || track.type==="overlay")) continue;
+    for(const c of track.clips){
+      if(c.type!=="video" || c.reverse || !clipIsActive(c,state.currentTime)) continue;
+      const media=mediaById(c.mediaId); if(!media) continue;
+      const runtime=createClipRuntime(c,media);
+      if(runtime?.el && !runtime.el.paused) found=runtime.el;
+    }
+  }
+  return found;
+}
+function scheduleDecodedFramePreview(){
+  if(!state.isPlaying || state.isExporting || state.previewFrameCallback!=null) return false;
+  const el=activePreviewVideoElement();
+  if(!el || typeof el.requestVideoFrameCallback!=="function") return false;
+  state.previewFrameVideo=el;
+  state.previewFrameCallback=el.requestVideoFrameCallback(()=>{
+    state.previewFrameCallback=null;
+    state.previewFrameVideo=null;
+    if(!state.isPlaying || state.isExporting) return;
+    renderPreview(false);
+    updatePlayhead();
+    updateTimeLabel();
+    scheduleDecodedFramePreview();
+  });
+  return true;
+}
 function syncPreviewPlayback(){
   const activeIds=new Set();
   for(const track of state.project.tracks){
@@ -370,17 +413,29 @@ function syncPreviewPlayback(){
       const el=runtime.el;
       const speed=clipSpeed(c);
       try{
-        el.playbackRate=speed;
-        el.defaultPlaybackRate=speed;
-        if("preservesPitch" in el) el.preservesPitch=true;
-        if("webkitPreservesPitch" in el) el.webkitPreservesPitch=true;
+        if(Math.abs((el.playbackRate||1)-speed)>.001) el.playbackRate=speed;
+        if(Math.abs((el.defaultPlaybackRate||1)-speed)>.001) el.defaultPlaybackRate=speed;
+        // Pitch preservation can be expensive on mobile at extreme rates. Disable it above 4x.
+        const preserve=speed<=4;
+        if("preservesPitch" in el) el.preservesPitch=preserve;
+        if("webkitPreservesPitch" in el) el.webkitPreservesPitch=preserve;
       }catch{}
       activeIds.add(c.id);
       const target=clamp(clipLocalTime(c,state.currentTime),0,Math.max(0,(media.duration||0)-.01));
-      const tolerance=state.isPlaying ? .35 : state.isExporting ? .20 : .035;
+      const newlyActive=!runtime.previewActive;
+      runtime.previewActive=true;
 
-      if(!state.isExporting && el.readyState>=1 && Math.abs((el.currentTime||0)-target)>tolerance){
-        try{ el.currentTime=target; }catch{}
+      // At high speeds, constantly correcting tiny source-time differences causes visible
+      // seek/decode flashes. Let native playback run and only correct meaningful drift.
+      const playingTolerance=Math.max(.40,Math.min(4.0,.22*speed));
+      const tolerance=state.isPlaying ? playingTolerance : state.isExporting ? .20 : .035;
+      const drift=Math.abs((el.currentTime||0)-target);
+
+      if(!state.isExporting && el.readyState>=1 && (newlyActive || (!state.isPlaying && drift>tolerance))){
+        try{
+          if(typeof el.fastSeek==="function" && drift>.25) el.fastSeek(target);
+          else el.currentTime=target;
+        }catch{}
       }
 
       const gain=previewGain(c,state.currentTime);
@@ -391,7 +446,7 @@ function syncPreviewPlayback(){
         if(c.reverse){
           if(!el.paused) el.pause();
           el.muted=true;
-          if(el.readyState>=1 && Math.abs((el.currentTime||0)-target)>.025){
+          if(el.readyState>=1 && drift>.025){
             try{el.currentTime=target;}catch{}
           }
         }else{
@@ -399,8 +454,13 @@ function syncPreviewPlayback(){
             const p=el.play();
             if(p?.catch) p.catch(()=>{});
           }
-          if(!state.isExporting && el.readyState>=1 && Math.abs((el.currentTime||0)-target)>.20){
-            try{el.currentTime=target;}catch{}
+          // Only hard-resync if drift is large enough to be perceptible. This threshold
+          // scales with clip speed, which prevents rapid seeking above ~4x.
+          if(!state.isExporting && !newlyActive && el.readyState>=1 && drift>playingTolerance){
+            try{
+              if(typeof el.fastSeek==="function" && drift>.5) el.fastSeek(target);
+              else el.currentTime=target;
+            }catch{}
           }
         }
       }else if(!el.paused){
@@ -410,11 +470,17 @@ function syncPreviewPlayback(){
   }
 
   for(const [clipId,runtime] of state.clipRuntime){
-    if(!activeIds.has(clipId) && !runtime.el.paused) runtime.el.pause();
+    if(!activeIds.has(clipId)){
+      runtime.previewActive=false;
+      if(!runtime.el.paused) runtime.el.pause();
+    }
   }
+  if(state.isPlaying && !state.isExporting) scheduleDecodedFramePreview();
 }
 function pausePreviewPlayback(){
+  cancelPreviewFrameCallback();
   for(const runtime of state.clipRuntime.values()){
+    runtime.previewActive=false;
     try{ runtime.el.pause(); }catch{}
   }
 }
@@ -543,9 +609,9 @@ function drawFit(el,c,canvas,ctx){
   ctx.restore();
 }
 
-function renderPreview(){
+function renderPreview(syncMedia=true){
   configureCanvas();
-  syncPreviewPlayback();
+  if(syncMedia) syncPreviewPlayback();
   ctx.fillStyle="#000"; ctx.fillRect(0,0,els.canvas.width,els.canvas.height);
   const videoTracks=state.project.tracks.filter(t=>t.type==="video"||t.type==="overlay");
   let drawn=false;
@@ -645,6 +711,40 @@ function renderPreview(){
   els.emptyPreview.style.display = drawn || subs.length || textItems.length ? "none" : "flex";
 }
 
+function disposeClipRuntime(clipId){
+  const runtime=state.clipRuntime.get(clipId);
+  if(!runtime) return;
+  try{runtime.el.pause();}catch{}
+  try{runtime.el.removeAttribute("src");runtime.el.load?.();}catch{}
+  state.clipRuntime.delete(clipId);
+}
+async function removeMedia(mediaId){
+  const media=mediaById(mediaId); if(!media) return;
+  const used=[];
+  for(const track of state.project.tracks){
+    for(const c of track.clips) if(c.mediaId===mediaId) used.push({track,clip:c});
+  }
+  const message=used.length
+    ? `Remove “${media.name}” from Media and delete ${used.length} timeline clip${used.length===1?"":"s"} that use it?`
+    : `Remove “${media.name}” from Media?`;
+  if(!confirm(message)) return;
+  commitHistory();
+  pausePreviewPlayback();
+  const removedIds=new Set(used.map(x=>x.clip.id));
+  for(const {track} of used) track.clips=track.clips.filter(c=>c.mediaId!==mediaId);
+  for(const id of removedIds) disposeClipRuntime(id);
+  if(removedIds.has(state.selectedClipId)) state.selectedClipId=null;
+  state.selectedGap=null;
+  const shared=state.mediaRuntime.get(mediaId);
+  if(shared){
+    try{shared.el?.pause?.();}catch{}
+    state.mediaRuntime.delete(mediaId);
+  }
+  try{if(media.url) URL.revokeObjectURL(media.url);}catch{}
+  state.media=state.media.filter(m=>m.id!==mediaId);
+  try{await dbDelete(MEDIA_STORE,mediaId);}catch{}
+  renderAll();
+}
 function renderMediaBin(){
   els.mediaBin.innerHTML="";
   if(!state.media.length){
@@ -665,15 +765,16 @@ function renderMediaBin(){
     });
     card.addEventListener("dragend",()=>card.classList.remove("dragging-media"));
     const thumb=document.createElement("div"); thumb.className="media-thumb";
-    const r=createRuntime(m);
+    createRuntime(m);
     if(m.type==="image"){
       const img=document.createElement("img"); img.src=m.url; thumb.appendChild(img);
     } else if(m.type==="video"){
-      const v=document.createElement("video"); v.src=m.url; v.muted=true; v.preload="metadata"; thumb.appendChild(v);
+      const v=document.createElement("video"); v.src=m.url; v.muted=true; v.preload="metadata"; v.playsInline=true; thumb.appendChild(v);
     } else thumb.textContent="AUDIO";
     const name=document.createElement("div"); name.className="media-name"; name.textContent=m.name;
     const meta=document.createElement("div"); meta.className="media-meta";
     meta.textContent=`${m.type}${m.duration?` • ${fmt(m.duration)}`:""}`;
+    const actions=document.createElement("div"); actions.className="media-card-actions";
     const add=document.createElement("button"); add.textContent="Add to timeline";
     add.onclick=()=>{
       const selected=selectedClip();
@@ -683,18 +784,104 @@ function renderMediaBin(){
         addMediaToTimeline(m.id);
       }
     };
-    card.append(thumb,name,meta,add);
+    const remove=document.createElement("button");
+    remove.type="button"; remove.className="media-remove"; remove.textContent="×";
+    remove.title="Remove media"; remove.setAttribute("aria-label",`Remove ${m.name}`);
+    remove.onclick=(e)=>{e.stopPropagation();removeMedia(m.id);};
+    actions.append(add,remove);
+    card.append(thumb,name,meta,actions);
     els.mediaBin.appendChild(card);
   }
 }
-function timelineWidth(){
-  return Math.max(800,(projectDuration()+10)*state.pixelsPerSecond);
+
+const MIN_TIMELINE_PPS=.25;
+const MAX_TIMELINE_PPS=420;
+function timelineViewportWidth(){
+  return Math.max(240,els.timelineMain?.clientWidth||800);
 }
+function timelineWidth(){
+  const viewport=timelineViewportWidth();
+  const duration=Math.max(projectDuration(),1);
+  const tail=Math.min(10,Math.max(.5,duration*.04));
+  return Math.max(viewport,(duration+tail)*state.pixelsPerSecond);
+}
+function updateTimelineZoomUI(){
+  if(els.zoom) els.zoom.value=String(clamp(state.pixelsPerSecond,Number(els.zoom.min)||1,Number(els.zoom.max)||320));
+  if(els.timelineZoomLabel){
+    const pps=state.pixelsPerSecond;
+    els.timelineZoomLabel.textContent=pps<10?`${pps.toFixed(1)} px/s`:`${Math.round(pps)} px/s`;
+  }
+}
+function setTimelineZoom(nextPps,anchorTime=state.currentTime,anchorScreenX=null){
+  const main=els.timelineMain;
+  const oldPps=state.pixelsPerSecond;
+  nextPps=clamp(Number(nextPps)||oldPps,MIN_TIMELINE_PPS,MAX_TIMELINE_PPS);
+  if(!main){state.pixelsPerSecond=nextPps;renderRuler();renderTracks();updateTimelineZoomUI();return;}
+  const oldAnchorX=anchorScreenX==null ? anchorTime*oldPps-main.scrollLeft : anchorScreenX;
+  state.pixelsPerSecond=nextPps;
+  renderRuler(); renderTracks(); updateTimelineZoomUI();
+  main.scrollLeft=Math.max(0,anchorTime*nextPps-oldAnchorX);
+}
+function zoomTimelineBy(factor){
+  setTimelineZoom(state.pixelsPerSecond*factor,state.currentTime);
+}
+function fitTimeline(){
+  const duration=projectDuration();
+  const main=els.timelineMain;
+  if(!main || duration<=0){setTimelineZoom(90,0,0);if(main) main.scrollLeft=0;return;}
+  const available=Math.max(120,main.clientWidth-18);
+  const next=clamp(available/Math.max(.25,duration),MIN_TIMELINE_PPS,MAX_TIMELINE_PPS);
+  state.pixelsPerSecond=next;
+  renderRuler(); renderTracks(); updateTimelineZoomUI();
+  main.scrollLeft=0;
+}
+function computeTrackGaps(track){
+  if(!track || !["video","audio"].includes(track.type)) return [];
+  const clips=track.clips.slice().filter(c=>Number(c.duration)>0).sort((a,b)=>a.start-b.start);
+  if(!clips.length) return [];
+  const gaps=[];
+  let coveredEnd=0;
+  for(const c of clips){
+    const start=Math.max(0,Number(c.start)||0);
+    const end=Math.max(start,start+(Number(c.duration)||0));
+    if(start-coveredEnd>.025) gaps.push({trackId:track.id,start:coveredEnd,end,duration:start-coveredEnd});
+    coveredEnd=Math.max(coveredEnd,end);
+  }
+  return gaps;
+}
+function selectedGapIsCurrent(g){
+  const s=state.selectedGap;
+  return !!s && s.trackId===g.trackId && Math.abs(s.start-g.start)<.02 && Math.abs(s.end-g.end)<.02;
+}
+function selectGap(g){
+  state.selectedClipId=null;
+  state.selectedGap={trackId:g.trackId,start:g.start,end:g.end};
+  state.currentTime=g.start;
+  renderAll();
+}
+function closeSelectedGap(){
+  const gap=state.selectedGap; if(!gap) return false;
+  const track=state.project.tracks.find(t=>t.id===gap.trackId); if(!track) return false;
+  const current=computeTrackGaps(track).find(g=>Math.abs(g.start-gap.start)<.03 && Math.abs(g.end-gap.end)<.03)
+    || computeTrackGaps(track).find(g=>state.currentTime>=g.start-.02 && state.currentTime<=g.end+.02);
+  if(!current || current.duration<=.025){state.selectedGap=null;renderAll();return false;}
+  commitHistory();
+  const shift=current.duration;
+  for(const c of track.clips){
+    if(c.start>=current.end-.02) c.start=Math.max(0,c.start-shift);
+  }
+  state.currentTime=current.start;
+  state.selectedGap=null;
+  renderAll();
+  return true;
+}
+
 function renderRuler(){
   const width=timelineWidth(); els.ruler.style.width=width+"px";
   els.ruler.innerHTML="";
   const dur=width/state.pixelsPerSecond;
-  const step=state.pixelsPerSecond>120?1:state.pixelsPerSecond>70?2:5;
+  const pps=state.pixelsPerSecond;
+  const step=pps>=180?.5:pps>=90?1:pps>=45?2:pps>=18?5:pps>=7?10:pps>=2?30:60;
   for(let t=0;t<=dur;t+=step){
     const mark=document.createElement("div"); mark.className="ruler-mark";
     mark.style.left=(t*state.pixelsPerSecond)+"px";
@@ -738,12 +925,25 @@ function renderTracks(){
       const startTime=Math.max(0,x/state.pixelsPerSecond);
       addMediaToTrack(mediaId,track,startTime);
     });
+    for(const g of computeTrackGaps(track)){
+      const gap=document.createElement("div");
+      gap.className=`timeline-gap${selectedGapIsCurrent(g)?" selected":""}`;
+      gap.style.left=(g.start*state.pixelsPerSecond)+"px";
+      gap.style.width=Math.max(4,g.duration*state.pixelsPerSecond)+"px";
+      gap.title=`Gap ${fmt(g.duration)} — click, then Delete or Close gap`;
+      if(g.duration*state.pixelsPerSecond>52){
+        const label=document.createElement("span"); label.className="timeline-gap-label"; label.textContent=`Gap ${fmt(g.duration)}`; gap.appendChild(label);
+      }
+      gap.addEventListener("pointerdown",e=>e.stopPropagation());
+      gap.addEventListener("click",e=>{e.stopPropagation();selectGap(g);});
+      row.appendChild(gap);
+    }
     for(const c of track.clips){
       const div=document.createElement("div");
       div.className=`clip ${c.type||track.type}${c.reverse?" reverse":""}${c.id===state.selectedClipId?" selected":""}`;
       div.dataset.clipId=c.id;
       div.style.left=(c.start*state.pixelsPerSecond)+"px";
-      div.style.width=Math.max(24,c.duration*state.pixelsPerSecond)+"px";
+      div.style.width=Math.max(state.pixelsPerSecond<6?4:state.pixelsPerSecond<18?8:24,c.duration*state.pixelsPerSecond)+"px";
       const title=document.createElement("div"); title.className="clip-title";
       title.textContent=(c.type==="subtitle"||c.type==="text")?(c.text||(c.type==="text"?"Text":"Subtitle")):(mediaById(c.mediaId)?.name||"Missing media");
       const meta=document.createElement("div"); meta.className="clip-meta";
@@ -762,7 +962,7 @@ function renderTracks(){
       resizeHandle.addEventListener("pointerdown",(e)=>startClipResize(e,c,track));
       div.appendChild(resizeHandle);
       div.addEventListener("pointerdown",(e)=>startClipDrag(e,c,track));
-      div.addEventListener("click",(e)=>{e.stopPropagation();state.selectedClipId=c.id;renderAll();});
+      div.addEventListener("click",(e)=>{e.stopPropagation();state.selectedClipId=c.id;state.selectedGap=null;renderAll();});
       row.appendChild(div);
     }
     els.tracks.appendChild(row);
@@ -904,8 +1104,9 @@ function renderAll(){
   els.projectNameLabel.textContent=state.project.name;
   const sel=selectedClip();
   els.previewStage?.classList.toggle("position-edit",!!sel && ["video","image","text","subtitle"].includes(sel.clip.type) && !state.isPlaying);
-  renderMediaBin(); renderRuler(); renderTracks(); renderInspector(); renderPreview(); updateTimeLabel();
+  renderMediaBin(); renderRuler(); renderTracks(); renderInspector(); renderPreview(); updateTimeLabel(); updateTimelineZoomUI();
   $("#undoBtn").disabled=!state.history.length; $("#redoBtn").disabled=!state.future.length;
+  const gapBtn=$("#closeGapBtn"); if(gapBtn) gapBtn.disabled=!state.selectedGap;
 }
 function updatePlayhead(){
   els.playhead.style.left=(state.currentTime*state.pixelsPerSecond)+"px";
@@ -994,6 +1195,7 @@ function addMediaToTrack(mediaId,track,startTime){
   };
   track.clips.push(c);
   state.selectedClipId=c.id;
+  state.selectedGap=null;
   state.currentTime=c.start;
   renderAll();
   return true;
@@ -1019,6 +1221,7 @@ function deleteTrack(id){
   commitHistory();
   state.project.tracks=state.project.tracks.filter(x=>x.id!==id);
   if(t.clips.some(c=>c.id===state.selectedClipId)) state.selectedClipId=null;
+  if(state.selectedGap?.trackId===id) state.selectedGap=null;
   renderAll();
 }
 function splitSelected(){
@@ -1046,17 +1249,19 @@ function splitSelected(){
     c.keyframes=originalFrames.filter(k=>k.time<=leftDur+.0001).map(k=>({...k,time:clamp(k.time,0,leftDur)}));
     right.keyframes=originalFrames.filter(k=>k.time>=leftDur-.0001).map(k=>({...k,time:clamp(k.time-leftDur,0,right.duration)}));
   }
-  track.clips.push(right); state.selectedClipId=right.id; renderAll();
+  track.clips.push(right); state.selectedClipId=right.id; state.selectedGap=null; renderAll();
 }
 function duplicateSelected(){
   const sel=selectedClip(); if(!sel) return;
   commitHistory();
   const copy=deepClone(sel.clip); copy.id=uid(); copy.start=sel.clip.start+sel.clip.duration+.05;
-  sel.track.clips.push(copy); state.selectedClipId=copy.id; renderAll();
+  sel.track.clips.push(copy); state.selectedClipId=copy.id; state.selectedGap=null; renderAll();
 }
 function deleteSelected(){
+  if(state.selectedGap){closeSelectedGap();return;}
   const sel=selectedClip(); if(!sel) return;
   commitHistory();
+  disposeClipRuntime(sel.clip.id);
   sel.track.clips=sel.track.clips.filter(c=>c.id!==sel.clip.id);
   state.selectedClipId=null; renderAll();
 }
@@ -1128,7 +1333,8 @@ function saveSubtitle(){
 }
 
 function onTimelinePointerDown(e,track){
-  if(e.target.closest(".clip")) return;
+  if(e.target.closest(".clip,.timeline-gap")) return;
+  state.selectedGap=null;
   const rect=e.currentTarget.getBoundingClientRect();
   const x=e.clientX-rect.left+e.currentTarget.parentElement.scrollLeft;
   state.currentTime=clamp(x/state.pixelsPerSecond,0,projectDuration()+10);
@@ -1139,6 +1345,7 @@ function startClipResize(e,c,track){
   e.preventDefault();
   e.stopPropagation();
   state.selectedClipId=c.id;
+  state.selectedGap=null;
   commitHistory();
 
   const startX=e.clientX;
@@ -1169,6 +1376,7 @@ function startClipResize(e,c,track){
 function startClipDrag(e,c,track){
   e.stopPropagation();
   state.selectedClipId=c.id;
+  state.selectedGap=null;
   commitHistory();
   state.drag={clip:c,track,startX:e.clientX,startY:e.clientY,origStart:c.start};
   e.currentTarget.setPointerCapture?.(e.pointerId);
@@ -1227,7 +1435,11 @@ function tick(ts){
   const interval=1000/targetFps;
   if(!state.lastPreviewFrame || ts-state.lastPreviewFrame>=interval){
     state.lastPreviewFrame=ts;
-    renderPreview();
+    // Let decoded video frames drive canvas drawing when supported. For image/audio-only
+    // sections, retain the normal animation-frame preview.
+    const frameDriven=scheduleDecodedFramePreview();
+    if(!frameDriven && state.previewFrameCallback==null) renderPreview();
+    else syncPreviewPlayback();
     updatePlayhead();
     updateTimeLabel();
   }
@@ -1838,11 +2050,22 @@ function bind(){
   ["dragleave","drop"].forEach(ev=>els.dropZone.addEventListener(ev,e=>{e.preventDefault();els.dropZone.classList.remove("drag")}));
   els.dropZone.addEventListener("drop",e=>importFiles([...e.dataTransfer.files]));
   els.playBtn.onclick=togglePlay; if(els.previewPlayBtn) els.previewPlayBtn.onclick=togglePlay; els.canvas.onclick=()=>{if(state.isPlaying) togglePlay();}; els.canvas.addEventListener("pointerdown",(e)=>startPreviewPositionDrag(e)); $("#rewindBtn").onclick=()=>seekBy(-5); $("#forwardBtn").onclick=()=>seekBy(5);
-  $("#splitBtn").onclick=splitSelected; $("#duplicateBtn").onclick=duplicateSelected; $("#deleteBtn").onclick=deleteSelected;
+  $("#splitBtn").onclick=splitSelected; $("#duplicateBtn").onclick=duplicateSelected; $("#deleteBtn").onclick=deleteSelected; $("#closeGapBtn").onclick=closeSelectedGap;
   $("#detachAudioBtn").onclick=detachAudio; $("#reverseBtn").onclick=reverseSelected; $("#addSubtitleBtn").onclick=addSubtitle; $("#addTextBtn")?.addEventListener("click",addTextOverlay);
   $("#addVideoTrackBtn").onclick=()=>addTrack("video"); $("#addAudioTrackBtn").onclick=()=>addTrack("audio");
   $("#undoBtn").onclick=undo; $("#redoBtn").onclick=redo;
-  els.zoom.oninput=()=>{state.pixelsPerSecond=Number(els.zoom.value);renderRuler();renderTracks();};
+  els.zoom.oninput=()=>setTimelineZoom(Number(els.zoom.value),state.currentTime);
+  $("#timelineZoomOutBtn").onclick=()=>zoomTimelineBy(1/1.35);
+  $("#timelineZoomInBtn").onclick=()=>zoomTimelineBy(1.35);
+  $("#timelineFitBtn").onclick=fitTimeline;
+  els.timelineMain?.addEventListener("wheel",(e)=>{
+    if(!(e.ctrlKey||e.metaKey)) return;
+    e.preventDefault();
+    const rect=els.timelineMain.getBoundingClientRect();
+    const x=e.clientX-rect.left;
+    const anchor=(els.timelineMain.scrollLeft+x)/state.pixelsPerSecond;
+    setTimelineZoom(state.pixelsPerSecond*(e.deltaY<0?1.18:1/1.18),anchor,x);
+  },{passive:false});
   if(els.fullscreenBtn) els.fullscreenBtn.onclick=toggleFullscreen;
   document.addEventListener("fullscreenchange",syncFullscreenButton);
   document.addEventListener("webkitfullscreenchange",syncFullscreenButton);
@@ -1862,11 +2085,12 @@ function bind(){
   window.addEventListener("keydown",(e)=>{
     if(["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName)) return;
     if(e.code==="Space"){e.preventDefault();togglePlay();}
+    if(!e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase()==="s"){e.preventDefault();splitSelected();}
     if(e.key==="Escape" && els.previewPanel?.classList.contains("fallback-fullscreen")){els.previewPanel.classList.remove("fallback-fullscreen");document.body.classList.remove("preview-fallback-fullscreen");syncFullscreenButton();}
     if(e.key==="Delete"||e.key==="Backspace") deleteSelected();
     if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="z"){e.preventDefault();e.shiftKey?redo():undo();}
   });
-  window.addEventListener("resize",()=>renderPreview());
+  window.addEventListener("resize",()=>{renderPreview();renderRuler();renderTracks();});
   window.addEventListener("beforeunload",()=>createBackup("auto"));
 }
 async function init(){
