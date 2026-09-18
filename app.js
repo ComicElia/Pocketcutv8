@@ -145,6 +145,10 @@ const state = {
   isExporting: false,
   exportRenderLongSide: 0,
   autosaveTimer: null,
+  pendingMediaPersist: new Set(),
+  mediaPersistTimer: 0,
+  mediaPersistInFlight: false,
+  pendingBackupKind: null,
 };
 safeLocalSet("pc-project-id",state.project.id);
 
@@ -242,6 +246,42 @@ async function ensureMediaPersisted(media){
   await dbPut(MEDIA_STORE,{id:media.id,blob,meta:mediaMetadata(media)});
   const check=await dbGet(MEDIA_STORE,media.id);
   return !!check?.blob;
+}
+
+function queueMediaPersistence(media, delay=1800){
+  if(!media?.id) return;
+  state.pendingMediaPersist.add(media.id);
+  armMediaPersistence(delay);
+}
+function armMediaPersistence(delay=1800){
+  clearTimeout(state.mediaPersistTimer);
+  state.mediaPersistTimer=0;
+  if(state.isPlaying || state.isExporting || state.mediaPersistInFlight || !state.pendingMediaPersist.size) return;
+  state.mediaPersistTimer=setTimeout(()=>processMediaPersistenceQueue(),Math.max(250,delay));
+}
+async function processMediaPersistenceQueue(){
+  if(state.mediaPersistInFlight || state.isPlaying || state.isExporting) return;
+  state.mediaPersistInFlight=true;
+  try{
+    while(state.pendingMediaPersist.size && !state.isPlaying && !state.isExporting){
+      const id=state.pendingMediaPersist.values().next().value;
+      state.pendingMediaPersist.delete(id);
+      const media=mediaById(id);
+      if(media){
+        try{await ensureMediaPersisted(media);}catch(err){console.warn("PocketCut media persistence failed",err);}
+      }
+      // Yield between large IndexedDB transactions so controls remain responsive.
+      await new Promise(r=>setTimeout(r,120));
+    }
+  }finally{
+    state.mediaPersistInFlight=false;
+    if(state.pendingMediaPersist.size) armMediaPersistence(1400);
+    else if(state.pendingBackupKind && !state.isPlaying && !state.isExporting){
+      const kind=state.pendingBackupKind;
+      state.pendingBackupKind=null;
+      setTimeout(()=>createBackup(kind),0);
+    }
+  }
 }
 function bytesToBase64(bytes){
   let out="";
@@ -472,7 +512,9 @@ function createClipRuntime(c, media){
 
 function pruneClipRuntimes(activeIds=new Set(), aggressive=false){
   const mobile=isMobileDevice();
-  const limit=mobile?(isLowMemoryMobile()?2:4):12;
+  // Keep a small warm decoder pool on mobile. The previous 2-decoder cap was
+  // too aggressive and could unload the next clip just before a cut.
+  const limit=mobile?(isLowMemoryMobile()?3:5):12;
   const now=performance.now();
   const inactive=[];
   for(const [clipId,runtime] of state.clipRuntime){
@@ -487,7 +529,7 @@ function pruneClipRuntimes(activeIds=new Set(), aggressive=false){
   inactive.sort((a,b)=>(a[1].lastUsed||0)-(b[1].lastUsed||0));
   let excess=Math.max(0,state.clipRuntime.size-limit);
   for(const [clipId,runtime] of inactive){
-    const stale=now-(runtime.inactiveSince||now)>(mobile?1800:10000);
+    const stale=now-(runtime.inactiveSince||now)>(mobile?10000:15000);
     if(aggressive || excess>0 || stale){
       disposeClipRuntime(clipId);
       if(excess>0) excess--;
@@ -526,7 +568,13 @@ function activePreviewVideoElement(){
   return found;
 }
 function scheduleDecodedFramePreview(){
-  if(!state.isPlaying || state.isExporting || state.previewFrameCallback!=null) return false;
+  if(!state.isPlaying || state.isExporting) return false;
+  // A frame callback attached to a clip that has just been paused at a cut may
+  // never fire again. Clear it before deciding whether a new callback is needed.
+  if(state.previewFrameCallback!=null && (!state.previewFrameVideo || state.previewFrameVideo.paused || state.previewFrameVideo.ended)){
+    cancelPreviewFrameCallback();
+  }
+  if(state.previewFrameCallback!=null) return true;
   const el=activePreviewVideoElement();
   if(!el || typeof el.requestVideoFrameCallback!=="function") return false;
   state.previewFrameVideo=el;
@@ -623,6 +671,20 @@ function syncPreviewPlayback(){
       runtime.previewActive=false;
       if(!runtime.inactiveSince) runtime.inactiveSince=performance.now();
       if(!runtime.el.paused) runtime.el.pause();
+    }
+  }
+  // If the decoded-frame callback still belongs to a clip that is no longer
+  // active, cancel it immediately so the next clip can become the frame driver.
+  if(state.previewFrameVideo){
+    let ownerStillActive=false;
+    for(const clipId of activeIds){
+      if(state.clipRuntime.get(clipId)?.el===state.previewFrameVideo){
+        ownerStillActive=true;
+        break;
+      }
+    }
+    if(!ownerStillActive || state.previewFrameVideo.paused || state.previewFrameVideo.ended){
+      cancelPreviewFrameCallback();
     }
   }
   pruneClipRuntimes(activeIds,false);
@@ -1481,16 +1543,14 @@ async function importFiles(files){
     const media={id,name:file.name,type,mime:file.type,size:file.size,url,blob:file,...meta};
     state.media.push(media);
 
-    // Do not block the UI waiting for a large phone video to be copied into IndexedDB.
-    // Extremely large files stay usable for this session without forcing an additional
-    // half-gigabyte storage write on a memory-constrained device.
-    const shouldPersist=!(isMobileDevice() && file.size>MOBILE_BIG_FILE_PERSIST_LIMIT);
-    if(shouldPersist){
-      const persist=()=>dbPut(MEDIA_STORE,{id,blob:file,meta:{name:file.name,type,mime:file.type,size:file.size,...meta}}).catch(()=>{});
-      if("requestIdleCallback" in window) requestIdleCallback(persist,{timeout:3000});
-      else setTimeout(persist,700);
+    // Never start a large IndexedDB copy while mobile playback may be decoding.
+    // Queue persistence and perform it only while the editor is paused/idle.
+    if(isMobileDevice()){
+      queueMediaPersistence(media, file.size>32*1024*1024 ? 2200 : 900);
     }else{
-      console.warn(`PocketCut: ${file.name} is too large for safe background persistence on mobile; re-import it after a page reload.`);
+      const persist=()=>dbPut(MEDIA_STORE,{id,blob:file,meta:{name:file.name,type,mime:file.type,size:file.size,...meta}}).catch(()=>{});
+      if("requestIdleCallback" in window) requestIdleCallback(persist,{timeout:5000});
+      else setTimeout(persist,900);
     }
   }
   renderAll();
@@ -1840,6 +1900,13 @@ function tick(ts){
   const interval=1000/targetFps;
   if(!state.lastPreviewFrame || ts-state.lastPreviewFrame>=interval){
     state.lastPreviewFrame=ts;
+
+    // Watchdog: a pending callback can get stranded if Android stalls or swaps a
+    // decoder. Do not let that freeze the entire canvas indefinitely.
+    if(state.previewFrameCallback!=null && state.lastDecodedPreviewFrame>0 && performance.now()-state.lastDecodedPreviewFrame>350){
+      cancelPreviewFrameCallback();
+    }
+
     // Let decoded video frames drive canvas drawing when supported. For image/audio-only
     // sections, retain the normal animation-frame preview.
     const frameDriven=scheduleDecodedFramePreview();
@@ -1869,10 +1936,12 @@ function syncPlayButtons(){
 function play(){
   if(projectDuration()<=0) return;
   if(state.currentTime>=projectDuration()) state.currentTime=0;
+  clearTimeout(state.mediaPersistTimer);
+  state.mediaPersistTimer=0;
   state.isPlaying=true;
   state.lastTick=0;
   state.lastPreviewFrame=0;
-  state.lastDecodedPreviewFrame=0;
+  state.lastDecodedPreviewFrame=performance.now();
   syncPlayButtons();
   // Start media immediately from the user gesture so mobile browsers allow playback.
   syncPreviewPlayback();
@@ -1884,6 +1953,13 @@ function pause(){
   syncPlayButtons();
   cancelAnimationFrame(state.raf);
   renderPreview();
+  // Large media persistence is deliberately delayed until playback has stopped.
+  if(state.pendingMediaPersist.size) armMediaPersistence(1200);
+  else if(state.pendingBackupKind){
+    const kind=state.pendingBackupKind;
+    state.pendingBackupKind=null;
+    setTimeout(()=>createBackup(kind),0);
+  }
 }
 function togglePlay(){state.isPlaying?pause():play();}
 function seekBy(delta){
@@ -1892,17 +1968,40 @@ function seekBy(delta){
 }
 
 async function createBackup(kind="auto"){
-  // Make sure every media item referenced by this autosave exists in the persistent
-  // media store before writing the timeline snapshot. This fixes backups restoring
-  // with empty video/audio/image placeholders.
-  for(const media of state.media){
-    try{await ensureMediaPersisted(media);}catch{}
+  // Never make a large IndexedDB media copy while video playback/export is active.
+  // Defer the backup until playback stops instead of stalling Android's decoder.
+  if(state.isPlaying || state.isExporting || state.mediaPersistInFlight){
+    state.pendingBackupKind=kind;
+    for(const media of state.media) state.pendingMediaPersist.add(media.id);
+    return false;
   }
-  const entry={id:uid(),projectId:state.project.id,kind,createdAt:Date.now(),data:serializeProject()};
-  await dbPut(BACKUP_STORE,entry);
-  const all=(await dbAll(BACKUP_STORE)).filter(x=>x.projectId===state.project.id).sort((a,b)=>b.createdAt-a.createdAt);
-  for(const old of all.slice(5)) await dbDelete(BACKUP_STORE,old.id);
-  if(els.backupDialog.open) renderBackupList();
+
+  clearTimeout(state.mediaPersistTimer);
+  state.mediaPersistTimer=0;
+  state.mediaPersistInFlight=true;
+  try{
+    // Ensure the media exists in persistent storage before committing the snapshot.
+    // Do this while paused, one asset at a time, yielding between writes.
+    for(const media of state.media){
+      state.pendingMediaPersist.delete(media.id);
+      try{await ensureMediaPersisted(media);}catch{}
+      await new Promise(r=>setTimeout(r,100));
+      if(state.isPlaying || state.isExporting){
+        state.pendingBackupKind=kind;
+        for(const m of state.media) state.pendingMediaPersist.add(m.id);
+        return false;
+      }
+    }
+    const entry={id:uid(),projectId:state.project.id,kind,createdAt:Date.now(),data:serializeProject()};
+    await dbPut(BACKUP_STORE,entry);
+    const all=(await dbAll(BACKUP_STORE)).filter(x=>x.projectId===state.project.id).sort((a,b)=>b.createdAt-a.createdAt);
+    for(const old of all.slice(5)) await dbDelete(BACKUP_STORE,old.id);
+    if(els.backupDialog.open) renderBackupList();
+    return true;
+  }finally{
+    state.mediaPersistInFlight=false;
+    if(state.pendingMediaPersist.size && !state.isPlaying && !state.isExporting) armMediaPersistence(1500);
+  }
 }
 async function renderBackupList(){
   const list=$("#backupList"); list.innerHTML="";
@@ -1927,7 +2026,7 @@ async function renderBackupList(){
 function scheduleAutosave(){
   if(state.autosaveTimer) clearInterval(state.autosaveTimer);
   const mins=Number(state.project.backupInterval)||0;
-  if(mins>0) state.autosaveTimer=setInterval(()=>createBackup("auto"),mins*60*1000);
+  if(mins>0) state.autosaveTimer=setInterval(()=>{createBackup("auto").catch(err=>console.warn("Autosave failed",err));},mins*60*1000);
   updateBackupWindowText();
 }
 function updateBackupWindowText(){
@@ -2575,7 +2674,7 @@ function bind(){
     }
   });
   window.addEventListener("pagehide",()=>{pausePreviewPlayback();pruneClipRuntimes(new Set(),true);});
-  window.addEventListener("beforeunload",()=>createBackup("auto"));
+  window.addEventListener("beforeunload",()=>{ /* Async IndexedDB writes are not reliable during unload. Periodic autosave handles persistence. */ });
 }
 async function init(){
   installDurationStyles();
