@@ -149,6 +149,7 @@ const state = {
   mediaPersistTimer: 0,
   mediaPersistInFlight: false,
   pendingBackupKind: null,
+  activeMediaPersistTx: null,
 };
 safeLocalSet("pc-project-id",state.project.id);
 
@@ -238,12 +239,38 @@ async function getMediaBlob(media){
   }
   return null;
 }
+async function persistMediaRecord(record){
+  const db=await openDB();
+  if(!db) return false;
+  return await new Promise((resolve)=>{
+    let finished=false;
+    const finish=(ok)=>{
+      if(finished) return;
+      finished=true;
+      if(state.activeMediaPersistTx===tx) state.activeMediaPersistTx=null;
+      resolve(ok);
+    };
+    let tx;
+    try{
+      tx=db.transaction(MEDIA_STORE,"readwrite");
+      state.activeMediaPersistTx=tx;
+      tx.objectStore(MEDIA_STORE).put(record);
+      tx.oncomplete=()=>finish(true);
+      tx.onerror=()=>finish(false);
+      tx.onabort=()=>finish(false);
+    }catch{
+      if(state.activeMediaPersistTx===tx) state.activeMediaPersistTx=null;
+      resolve(false);
+    }
+  });
+}
 async function ensureMediaPersisted(media){
   const existing=await dbGet(MEDIA_STORE,media.id);
   if(existing?.blob) return true;
   const blob=await getMediaBlob(media);
   if(!blob) return false;
-  await dbPut(MEDIA_STORE,{id:media.id,blob,meta:mediaMetadata(media)});
+  const ok=await persistMediaRecord({id:media.id,blob,meta:mediaMetadata(media)});
+  if(!ok) return false;
   const check=await dbGet(MEDIA_STORE,media.id);
   return !!check?.blob;
 }
@@ -268,10 +295,16 @@ async function processMediaPersistenceQueue(){
       state.pendingMediaPersist.delete(id);
       const media=mediaById(id);
       if(media){
-        try{await ensureMediaPersisted(media);}catch(err){console.warn("PocketCut media persistence failed",err);}
+        try{
+          const ok=await ensureMediaPersisted(media);
+          if(!ok && state.isPlaying) state.pendingMediaPersist.add(id);
+        }catch(err){
+          console.warn("PocketCut media persistence failed",err);
+          if(state.isPlaying) state.pendingMediaPersist.add(id);
+        }
       }
-      // Yield between large IndexedDB transactions so controls remain responsive.
-      await new Promise(r=>setTimeout(r,120));
+      // Yield between storage transactions so controls remain responsive.
+      await new Promise(r=>setTimeout(r,180));
     }
   }finally{
     state.mediaPersistInFlight=false;
@@ -326,38 +359,76 @@ function releaseMediaResources(){
     try{if(m?.url?.startsWith?.("blob:")) URL.revokeObjectURL(m.url);}catch{}
   }
 }
-async function applyProjectData(data){
+async function applyProjectData(data,{source="project"}={}){
   if(!data?.project?.tracks) throw new Error("Invalid project file");
-  commitHistory();
-  releaseMediaResources();
-  state.project=data.project;
-  state.selectedClipId=null;
-  state.selectedGap=null;
-  state.currentTime=0;
-  safeLocalSet("pc-project-id",state.project.id);
 
+  // Preserve live Blob references before releasing object URLs. This lets an old
+  // autosave recover media that is still open in the current session even if an
+  // earlier IndexedDB write never completed.
+  const currentMediaById=new Map(state.media.map(m=>[m.id,m]));
+  const nextProject=deepClone(data.project);
   const records=Array.isArray(data.media)?data.media:[];
+
+  commitHistory();
+  if(state.isPlaying) pause();
+  releaseMediaResources();
+
   const loaded=[];
+  const missing=[];
   for(const record of records){
     const meta=mediaMetadata(record);
-    let blob=null;
-    if(Array.isArray(record.dataBase64Chunks) && record.dataBase64Chunks.length){
+    let blob=record.blob instanceof Blob ? record.blob : null;
+
+    if(!blob && Array.isArray(record.dataBase64Chunks) && record.dataBase64Chunks.length){
       try{
         blob=base64ChunksToBlob(record.dataBase64Chunks,record.mime);
-        await dbPut(MEDIA_STORE,{id:record.id,blob,meta});
+        // Do not block restoration on storage. The Blob is immediately usable;
+        // persistence is queued afterward.
       }catch(err){
-        console.warn("PocketCut: could not restore embedded media",record.name,err);
+        console.warn("PocketCut: could not rebuild embedded media",record.name,err);
       }
-    }else{
-      const row=await dbGet(MEDIA_STORE,record.id);
-      if(row?.blob) blob=row.blob;
     }
-    loaded.push({...meta,blob,url:blob?URL.createObjectURL(blob):""});
+
+    if(!blob){
+      try{
+        const row=await dbGet(MEDIA_STORE,record.id);
+        if(row?.blob) blob=row.blob;
+      }catch(err){
+        console.warn("PocketCut: media lookup failed",record.name,err);
+      }
+    }
+
+    if(!blob){
+      const live=currentMediaById.get(record.id);
+      if(live?.blob instanceof Blob) blob=live.blob;
+    }
+
+    if(blob){
+      loaded.push({...meta,blob,url:URL.createObjectURL(blob)});
+    }else{
+      missing.push(record.name||record.id||"Unknown media");
+      loaded.push({...meta,blob:null,url:""});
+    }
   }
+
+  // Apply the actual timeline even when one media item is unavailable. A missing
+  // asset must never make a backup restore look like a no-op.
+  state.project=nextProject;
   state.media=loaded;
+  state.selectedClipId=null;
+  state.selectedGap=null;
+  state.currentTime=clamp(Number(data.currentTime)||0,0,projectDuration());
+  safeLocalSet("pc-project-id",state.project.id);
+
+  // Queue persistence only after the restore is already visible and usable.
+  for(const m of loaded){
+    if(m.blob instanceof Blob) queueMediaPersistence(m, source==="backup"?5000:2500);
+  }
+
   syncSettingsUI();
   scheduleAutosave();
   renderAll();
+  return {missing};
 }
 
 function getAspect(){
@@ -487,11 +558,11 @@ function createClipRuntime(c, media){
   let el;
   if(c.type==="audio"){
     el=document.createElement("audio");
-    el.preload=isMobileDevice()?"metadata":"auto";
+    el.preload="auto";
     el.src=media.url;
   }else if(media.type==="video"){
     el=document.createElement("video");
-    el.preload=isMobileDevice()?"metadata":"auto";
+    el.preload="auto";
     el.src=media.url;
     el.playsInline=true;
     el.setAttribute("playsinline","");
@@ -568,6 +639,10 @@ function activePreviewVideoElement(){
   return found;
 }
 function scheduleDecodedFramePreview(){
+  // requestVideoFrameCallback is efficient on desktop, but several Android
+  // WebView/Chrome decoder combinations can stop delivering callbacks mid-clip.
+  // Mobile uses the bounded requestAnimationFrame preview loop instead.
+  if(isMobileDevice()) return false;
   if(!state.isPlaying || state.isExporting) return false;
   // A frame callback attached to a clip that has just been paused at a cut may
   // never fire again. Clear it before deciding whether a new callback is needed.
@@ -624,7 +699,9 @@ function syncPreviewPlayback(){
 
       // At high speeds, constantly correcting tiny source-time differences causes visible
       // seek/decode flashes. Let native playback run and only correct meaningful drift.
-      const playingTolerance=Math.max(.40,Math.min(4.0,.22*speed));
+      const playingTolerance=isMobileDevice()
+        ? Math.max(.75,Math.min(5.0,.35*speed))
+        : Math.max(.40,Math.min(4.0,.22*speed));
       const tolerance=state.isPlaying ? playingTolerance : state.isExporting ? .20 : .035;
       const drift=Math.abs((el.currentTime||0)-target);
 
@@ -654,10 +731,17 @@ function syncPreviewPlayback(){
           // Only hard-resync if drift is large enough to be perceptible. This threshold
           // scales with clip speed, which prevents rapid seeking above ~4x.
           if(!state.isExporting && !newlyActive && el.readyState>=1 && drift>playingTolerance){
-            try{
-              if(typeof el.fastSeek==="function" && drift>.5) el.fastSeek(target);
-              else el.currentTime=target;
-            }catch{}
+            const now=performance.now();
+            // Repeated corrective seeks are one of the main causes of Android
+            // flashing/freezing. Never hard-resync the same decoder continuously.
+            const cooldown=isMobileDevice()?900:450;
+            if(!runtime.lastHardResync || now-runtime.lastHardResync>=cooldown){
+              runtime.lastHardResync=now;
+              try{
+                if(typeof el.fastSeek==="function" && drift>.5) el.fastSeek(target);
+                else el.currentTime=target;
+              }catch{}
+            }
           }
         }
       }else if(!el.paused){
@@ -687,9 +771,40 @@ function syncPreviewPlayback(){
       cancelPreviewFrameCallback();
     }
   }
-  pruneClipRuntimes(activeIds,false);
+  const keepIds=new Set(activeIds);
+  warmUpcomingClipRuntimes(keepIds);
+  pruneClipRuntimes(keepIds,false);
   if(state.isPlaying && !state.isExporting) scheduleDecodedFramePreview();
 }
+
+function warmUpcomingClipRuntimes(keepIds){
+  if(!state.isPlaying || !isMobileDevice()) return;
+  const horizon=1.25;
+  let nextVideo=null, nextAudio=null;
+  for(const track of state.project.tracks){
+    for(const c of track.clips){
+      const delta=c.start-state.currentTime;
+      if(delta<=0 || delta>horizon) continue;
+      const media=mediaById(c.mediaId);
+      if(!media?.url) continue;
+      if(c.type==="video" && (!nextVideo || c.start<nextVideo.start)) nextVideo=c;
+      if(c.type==="audio" && (!nextAudio || c.start<nextAudio.start)) nextAudio=c;
+    }
+  }
+  for(const c of [nextVideo,nextAudio]){
+    if(!c) continue;
+    const media=mediaById(c.mediaId);
+    const runtime=createClipRuntime(c,media);
+    if(!runtime) continue;
+    keepIds.add(c.id);
+    runtime.lastUsed=performance.now();
+    try{
+      runtime.el.preload="auto";
+      if(runtime.el.readyState===0) runtime.el.load();
+    }catch{}
+  }
+}
+
 function pausePreviewPlayback(){
   cancelPreviewFrameCallback();
   for(const runtime of state.clipRuntime.values()){
@@ -1896,14 +2011,14 @@ function tick(ts){
   if(state.currentTime>=dur){state.currentTime=dur;pause();return;}
 
   const mobile=isMobileDevice();
-  const targetFps=mobile?(isLowMemoryMobile()?15:20):30;
+  const targetFps=mobile?(isLowMemoryMobile()?18:24):30;
   const interval=1000/targetFps;
   if(!state.lastPreviewFrame || ts-state.lastPreviewFrame>=interval){
     state.lastPreviewFrame=ts;
 
     // Watchdog: a pending callback can get stranded if Android stalls or swaps a
     // decoder. Do not let that freeze the entire canvas indefinitely.
-    if(state.previewFrameCallback!=null && state.lastDecodedPreviewFrame>0 && performance.now()-state.lastDecodedPreviewFrame>350){
+    if(!mobile && state.previewFrameCallback!=null && state.lastDecodedPreviewFrame>0 && performance.now()-state.lastDecodedPreviewFrame>500){
       cancelPreviewFrameCallback();
     }
 
@@ -1938,6 +2053,12 @@ function play(){
   if(state.currentTime>=projectDuration()) state.currentTime=0;
   clearTimeout(state.mediaPersistTimer);
   state.mediaPersistTimer=0;
+  // A large Blob transaction can monopolize storage/IO on Android. Abort an
+  // in-progress media persistence transaction as soon as the user presses Play;
+  // the queue will retry after playback is paused.
+  if(state.activeMediaPersistTx){
+    try{state.activeMediaPersistTx.abort();}catch{}
+  }
   state.isPlaying=true;
   state.lastTick=0;
   state.lastPreviewFrame=0;
@@ -1982,15 +2103,22 @@ async function createBackup(kind="auto"){
   try{
     // Ensure the media exists in persistent storage before committing the snapshot.
     // Do this while paused, one asset at a time, yielding between writes.
+    let allPersisted=true;
     for(const media of state.media){
       state.pendingMediaPersist.delete(media.id);
-      try{await ensureMediaPersisted(media);}catch{}
-      await new Promise(r=>setTimeout(r,100));
+      let ok=false;
+      try{ok=await ensureMediaPersisted(media);}catch{}
+      if(!ok) allPersisted=false;
+      await new Promise(r=>setTimeout(r,120));
       if(state.isPlaying || state.isExporting){
         state.pendingBackupKind=kind;
         for(const m of state.media) state.pendingMediaPersist.add(m.id);
         return false;
       }
+    }
+    if(!allPersisted){
+      console.warn("PocketCut backup skipped because one or more media files are not persisted yet.");
+      return false;
     }
     const entry={id:uid(),projectId:state.project.id,kind,createdAt:Date.now(),data:serializeProject()};
     await dbPut(BACKUP_STORE,entry);
@@ -2017,8 +2145,26 @@ async function renderBackupList(){
     small.textContent=`${d.toLocaleString()} • ${fmt(dur)} project`;
     info.append(title,small);
     const acts=document.createElement("div"); acts.className="backup-item-actions";
-    const restore=document.createElement("button"); restore.textContent="Restore";
-    restore.onclick=async()=>{if(confirm("Restore this backup? Current unsaved changes will be replaced.")){await applyProjectData(b.data);els.backupDialog.close();}};
+    const restore=document.createElement("button"); restore.type="button"; restore.textContent="Restore";
+    restore.onclick=async()=>{
+      if(!confirm("Restore this backup? Current unsaved changes will be replaced.")) return;
+      const oldText=restore.textContent;
+      restore.disabled=true;
+      restore.textContent="Restoring…";
+      try{
+        const result=await applyProjectData(b.data,{source:"backup"});
+        els.backupDialog.close();
+        if(result.missing.length){
+          alert(`Backup restored, but ${result.missing.length} media file(s) are missing from browser storage: ${result.missing.join(", ")}`);
+        }
+      }catch(err){
+        console.error("PocketCut backup restore failed",err);
+        alert("Could not restore this backup. The backup metadata may be damaged or browser storage may be unavailable.");
+      }finally{
+        restore.disabled=false;
+        restore.textContent=oldText;
+      }
+    };
     const del=document.createElement("button"); del.textContent="Delete"; del.onclick=async()=>{await dbDelete(BACKUP_STORE,b.id);renderBackupList();};
     acts.append(restore,del); item.append(info,acts); list.appendChild(item);
   }
@@ -2047,77 +2193,240 @@ function saveSettings(){
   els.settingsDialog.close();
   scheduleAutosave(); renderAll();
 }
+const ZIP_CRC_TABLE=(()=>{
+  const table=new Uint32Array(256);
+  for(let n=0;n<256;n++){
+    let c=n;
+    for(let k=0;k<8;k++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);
+    table[n]=c>>>0;
+  }
+  return table;
+})();
+function zipU16(view,offset,value){view.setUint16(offset,value&0xffff,true);}
+function zipU32(view,offset,value){view.setUint32(offset,value>>>0,true);}
+function zipDosDateTime(date=new Date()){
+  const year=Math.max(1980,date.getFullYear());
+  const dosTime=((date.getHours()&31)<<11)|((date.getMinutes()&63)<<5)|((Math.floor(date.getSeconds()/2))&31);
+  const dosDate=(((year-1980)&127)<<9)|(((date.getMonth()+1)&15)<<5)|(date.getDate()&31);
+  return {dosTime,dosDate};
+}
+async function crc32Blob(blob,onProgress){
+  let crc=0xffffffff;
+  const CHUNK=4*1024*1024;
+  for(let offset=0;offset<blob.size;offset+=CHUNK){
+    const end=Math.min(blob.size,offset+CHUNK);
+    const bytes=new Uint8Array(await blob.slice(offset,end).arrayBuffer());
+    for(let i=0;i<bytes.length;i++) crc=ZIP_CRC_TABLE[(crc^bytes[i])&255]^(crc>>>8);
+    onProgress?.(end,blob.size);
+    await new Promise(r=>setTimeout(r,0));
+  }
+  return (crc^0xffffffff)>>>0;
+}
+function safeArchiveFileName(name,fallback){
+  let out=String(name||fallback||'media').replace(/[\\/\0-\x1f<>:"|?*]+/g,'_').replace(/^\.+/,'').trim();
+  if(!out) out=fallback||'media';
+  if(out.length>140){
+    const dot=out.lastIndexOf('.');
+    const ext=dot>0?out.slice(dot).slice(0,20):'';
+    out=out.slice(0,Math.max(1,140-ext.length))+ext;
+  }
+  return out;
+}
+function timelineMediaIds(){
+  const ids=new Set();
+  for(const track of state.project.tracks||[]){
+    for(const clip of track.clips||[]) if(clip.mediaId) ids.add(clip.mediaId);
+  }
+  return ids;
+}
+async function buildStoredZip(entries,onProgress){
+  const encoder=new TextEncoder();
+  const prepared=[];
+  let dataOffset=0;
+  let processed=0;
+  const totalBytes=entries.reduce((n,e)=>n+e.blob.size,0)||1;
+  for(let i=0;i<entries.length;i++){
+    const entry=entries[i];
+    if(entry.blob.size>0xffffffff) throw new Error(`ZIP32 cannot store files over 4 GB: ${entry.name}`);
+    const nameBytes=encoder.encode(entry.name);
+    if(nameBytes.length>0xffff) throw new Error('Archive filename is too long');
+    const crc=await crc32Blob(entry.blob,(done)=>onProgress?.(processed+done,totalBytes,entry.name,i,entries.length));
+    processed+=entry.blob.size;
+    const {dosTime,dosDate}=zipDosDateTime();
+    const local=new Uint8Array(30+nameBytes.length);
+    const lv=new DataView(local.buffer);
+    zipU32(lv,0,0x04034b50); zipU16(lv,4,20); zipU16(lv,6,0x0800); zipU16(lv,8,0);
+    zipU16(lv,10,dosTime); zipU16(lv,12,dosDate); zipU32(lv,14,crc); zipU32(lv,18,entry.blob.size); zipU32(lv,22,entry.blob.size);
+    zipU16(lv,26,nameBytes.length); zipU16(lv,28,0); local.set(nameBytes,30);
+    const localOffset=dataOffset;
+    dataOffset+=local.length+entry.blob.size;
+    if(dataOffset>0xffffffff) throw new Error('Project is too large for the PocketCut ZIP32 container (4 GB limit).');
+    prepared.push({...entry,nameBytes,crc,dosTime,dosDate,local,localOffset});
+  }
+  const centralParts=[];
+  let centralSize=0;
+  for(const e of prepared){
+    const c=new Uint8Array(46+e.nameBytes.length);
+    const v=new DataView(c.buffer);
+    zipU32(v,0,0x02014b50); zipU16(v,4,20); zipU16(v,6,20); zipU16(v,8,0x0800); zipU16(v,10,0);
+    zipU16(v,12,e.dosTime); zipU16(v,14,e.dosDate); zipU32(v,16,e.crc); zipU32(v,20,e.blob.size); zipU32(v,24,e.blob.size);
+    zipU16(v,28,e.nameBytes.length); zipU16(v,30,0); zipU16(v,32,0); zipU16(v,34,0); zipU16(v,36,0); zipU32(v,38,0); zipU32(v,42,e.localOffset);
+    c.set(e.nameBytes,46); centralParts.push(c); centralSize+=c.length;
+  }
+  if(prepared.length>0xffff) throw new Error('Too many files in project archive');
+  const eocd=new Uint8Array(22); const ev=new DataView(eocd.buffer);
+  zipU32(ev,0,0x06054b50); zipU16(ev,4,0); zipU16(ev,6,0); zipU16(ev,8,prepared.length); zipU16(ev,10,prepared.length);
+  zipU32(ev,12,centralSize); zipU32(ev,16,dataOffset); zipU16(ev,20,0);
+  const parts=[];
+  for(const e of prepared) parts.push(e.local,e.blob);
+  parts.push(...centralParts,eocd);
+  return new Blob(parts,{type:'application/x-pocketcut-project'});
+}
+async function readStoredZip(file){
+  if(file.size<22) throw new Error('Project archive is too small');
+  const tailSize=Math.min(file.size,22+0xffff);
+  const tailOffset=file.size-tailSize;
+  const tail=new Uint8Array(await file.slice(tailOffset).arrayBuffer());
+  let eocd=-1;
+  for(let i=tail.length-22;i>=0;i--){
+    if(tail[i]===0x50&&tail[i+1]===0x4b&&tail[i+2]===0x05&&tail[i+3]===0x06){eocd=i;break;}
+  }
+  if(eocd<0) throw new Error('ZIP end record not found');
+  const tv=new DataView(tail.buffer,tail.byteOffset+eocd);
+  const entryCount=tv.getUint16(10,true);
+  const centralSize=tv.getUint32(12,true);
+  const centralOffset=tv.getUint32(16,true);
+  if(centralOffset+centralSize>file.size) throw new Error('Invalid ZIP directory');
+  const central=new Uint8Array(await file.slice(centralOffset,centralOffset+centralSize).arrayBuffer());
+  const decoder=new TextDecoder('utf-8');
+  const entries=new Map();
+  let pos=0;
+  for(let i=0;i<entryCount;i++){
+    if(pos+46>central.length) throw new Error('Truncated ZIP directory');
+    const v=new DataView(central.buffer,central.byteOffset+pos);
+    if(v.getUint32(0,true)!==0x02014b50) throw new Error('Invalid ZIP directory entry');
+    const method=v.getUint16(10,true);
+    const compSize=v.getUint32(20,true);
+    const rawSize=v.getUint32(24,true);
+    const nameLen=v.getUint16(28,true), extraLen=v.getUint16(30,true), commentLen=v.getUint16(32,true);
+    const localOffset=v.getUint32(42,true);
+    const name=decoder.decode(central.subarray(pos+46,pos+46+nameLen));
+    entries.set(name,{name,method,compSize,rawSize,localOffset});
+    pos+=46+nameLen+extraLen+commentLen;
+  }
+  async function entryBlob(name,type='application/octet-stream'){
+    const e=entries.get(name); if(!e) return null;
+    if(e.method!==0) throw new Error(`Unsupported compression for ${name}. PocketCut projects use stored ZIP entries.`);
+    const head=new Uint8Array(await file.slice(e.localOffset,e.localOffset+30).arrayBuffer());
+    const hv=new DataView(head.buffer,head.byteOffset);
+    if(hv.getUint32(0,true)!==0x04034b50) throw new Error(`Invalid ZIP local entry: ${name}`);
+    const nameLen=hv.getUint16(26,true), extraLen=hv.getUint16(28,true);
+    const dataStart=e.localOffset+30+nameLen+extraLen;
+    if(dataStart+e.compSize>file.size) throw new Error(`Truncated ZIP entry: ${name}`);
+    return new Blob([file.slice(dataStart,dataStart+e.compSize)],{type});
+  }
+  return {entries,entryBlob};
+}
 async function downloadJSON(){
-  const btn=$("#downloadProjectBtn");
+  const btn=$('#downloadProjectBtn');
   const oldText=btn?.textContent;
-  if(btn){btn.disabled=true;btn.textContent="Packing media…";}
+  if(btn){btn.disabled=true;btn.textContent='Packing project…';}
   try{
-    // Build the JSON as Blob parts instead of one enormous JS string. This keeps
-    // peak memory considerably lower on phones while still producing a normal .json.
-    const parts=[];
-    parts.push('{\n  "version": 2,\n  "portable": true,\n  "project": ');
-    parts.push(JSON.stringify(baseProjectData(),null,2));
-    parts.push(',\n  "media": [\n');
+    const usedIds=timelineMediaIds();
+    const usedMedia=[];
+    const missingIds=[];
+    for(const id of usedIds){
+      const media=mediaById(id);
+      if(media) usedMedia.push(media); else missingIds.push(id);
+    }
+    const mediaRecords=[];
+    const archiveEntries=[];
     const missing=[];
-    for(let i=0;i<state.media.length;i++){
-      const m=state.media[i];
-      if(i) parts.push(',\n');
+    for(let i=0;i<usedMedia.length;i++){
+      const m=usedMedia[i];
+      if(btn) btn.textContent=`Finding media ${i+1}/${usedMedia.length}`;
       const blob=await getMediaBlob(m);
       const meta=mediaMetadata(m);
-      parts.push('    {\n');
-      const keys=Object.entries(meta);
-      for(const [k,v] of keys){
-        parts.push(`      ${JSON.stringify(k)}: ${JSON.stringify(v)},\n`);
-      }
       if(blob){
-        parts.push('      "dataEncoding": "base64-chunks",\n      "dataBase64Chunks": [');
-        const chunks=await blobToBase64Chunks(blob,(done,total)=>{
-          if(btn) btn.textContent=`Packing ${i+1}/${state.media.length} • ${Math.round(done/Math.max(1,total)*100)}%`;
-        });
-        for(let ci=0;ci<chunks.length;ci++){
-          if(ci) parts.push(',');
-          parts.push(JSON.stringify(chunks[ci]));
-        }
-        parts.push(']\n');
+        const safe=safeArchiveFileName(m.name,`media_${i+1}`);
+        const archivePath=`media/${String(i+1).padStart(3,'0')}_${m.id}_${safe}`;
+        mediaRecords.push({...meta,archivePath});
+        archiveEntries.push({name:archivePath,blob});
       }else{
-        missing.push(m.name);
-        parts.push('      "dataEncoding": "missing",\n      "dataBase64Chunks": []\n');
+        missing.push(m.name||m.id);
+        mediaRecords.push({...meta,archivePath:null});
       }
-      parts.push('    }');
       await new Promise(r=>setTimeout(r,0));
     }
-    parts.push('\n  ],\n  "note": "Self-contained PocketCut project. Media is embedded in this JSON as Base64 chunks."\n}\n');
-    const out=new Blob(parts,{type:"application/json"});
-    const a=document.createElement("a");
+    if(missingIds.length) missing.push(...missingIds.map(id=>`Missing media ${id}`));
+    const manifest={
+      version:3,
+      format:'pocketcut-project',
+      container:'zip-store',
+      project:baseProjectData(),
+      currentTime:state.currentTime,
+      media:mediaRecords,
+      note:'PocketCut project container. Only media referenced by timeline clips is included.'
+    };
+    const projectBlob=new Blob([JSON.stringify(manifest,null,2)],{type:'application/json'});
+    const entries=[{name:'project.json',blob:projectBlob},...archiveEntries];
+    const out=await buildStoredZip(entries,(done,total,name,index,count)=>{
+      if(btn) btn.textContent=`Packing ${index+1}/${count} • ${Math.round(done/Math.max(1,total)*100)}%`;
+    });
+    const a=document.createElement('a');
     a.href=URL.createObjectURL(out);
-    a.download=`${state.project.name.replace(/[^\w-]+/g,"_")||"pocketcut"}.json`;
+    a.download=`${state.project.name.replace(/[^\w-]+/g,'_')||'pocketcut'}.pocketcut`;
     a.click();
-    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
-    if(missing.length) alert(`Project exported, but ${missing.length} media file(s) could not be embedded: ${missing.join(", ")}`);
+    setTimeout(()=>URL.revokeObjectURL(a.href),10000);
+    if(missing.length) alert(`Project exported, but ${missing.length} timeline media file(s) could not be included: ${missing.join(', ')}`);
   }catch(err){
     console.error(err);
-    alert("Could not export the self-contained project. The phone may not have enough free memory/storage for the embedded media.");
+    alert(`Could not export PocketCut project: ${err?.message||err}`);
   }finally{
-    if(btn){btn.disabled=false;btn.textContent=oldText||"Download project";}
+    if(btn){btn.disabled=false;btn.textContent=oldText||'Download project file';}
   }
+}
+async function importPocketCutArchive(file){
+  const zip=await readStoredZip(file);
+  const manifestBlob=await zip.entryBlob('project.json','application/json');
+  if(!manifestBlob) throw new Error('project.json is missing from the PocketCut project');
+  const data=JSON.parse(await manifestBlob.text());
+  if(!data?.project?.tracks) throw new Error('Invalid PocketCut project manifest');
+  const records=[];
+  for(const record of Array.isArray(data.media)?data.media:[]){
+    let blob=null;
+    if(record.archivePath){
+      blob=await zip.entryBlob(record.archivePath,record.mime||'application/octet-stream');
+    }
+    records.push({...record,blob});
+  }
+  await applyProjectData({...data,media:records},{source:'project'});
 }
 async function importProjectFile(file){
   try{
+    const sig=new Uint8Array(await file.slice(0,4).arrayBuffer());
+    const isZip=sig.length===4&&sig[0]===0x50&&sig[1]===0x4b&&(sig[2]===0x03||sig[2]===0x05||sig[2]===0x07)&&sig[3]===0x04;
+    if(isZip || file.name.toLowerCase().endsWith('.pocketcut')){
+      await importPocketCutArchive(file);
+      return;
+    }
+    // Legacy JSON project support.
     const text=await file.text();
     const data=JSON.parse(text);
-    await applyProjectData(data);
+    await applyProjectData(data,{source:'project'});
   }catch(err){
     console.error(err);
-    alert("Could not open this PocketCut project JSON. It may be damaged or too large for the available memory.");
+    alert(`Could not open this PocketCut project: ${err?.message||'The file may be damaged or unsupported.'}`);
   }
 }
 async function restoreLatestSession(){
   const all=(await dbAll(BACKUP_STORE)).filter(x=>x.projectId===state.project.id).sort((a,b)=>b.createdAt-a.createdAt);
-  if(all.length){
-    state.project=all[0].data.project;
-    state.media=all[0].data.media||[];
-    await loadMediaFromDB();
-  }
+  if(!all.length) return;
+  const data=all[0].data;
+  if(!data?.project?.tracks) return;
+  state.project=deepClone(data.project);
+  state.media=Array.isArray(data.media)?data.media.map(m=>({...mediaMetadata(m)})):[];
+  try{await loadMediaFromDB();}catch(err){console.warn("PocketCut latest-session media restore failed",err);}
 }
 
 async function syncVideoFramesForTime(t){
@@ -2638,8 +2947,18 @@ function bind(){
   $("#saveSubtitleBtn").addEventListener("click",(e)=>{e.preventDefault();saveSubtitle();});
   $("#backupBtn").onclick=()=>{renderBackupList();els.backupDialog.showModal();};
   $("#closeBackupDialog").onclick=()=>els.backupDialog.close();
-  $("#createBackupNow").onclick=async()=>{await createBackup("manual");renderBackupList();};
+  $("#createBackupNow").onclick=async()=>{
+    const btn=$("#createBackupNow");
+    const old=btn.textContent;
+    btn.disabled=true; btn.textContent="Saving…";
+    try{
+      const ok=await createBackup("manual");
+      await renderBackupList();
+      if(ok===false && !state.isPlaying) alert("Backup was not created because one or more media files could not be saved to browser storage.");
+    }finally{btn.disabled=false;btn.textContent=old;}
+  };
   $("#downloadProjectBtn").onclick=downloadJSON;
+  $("#projectFileInput").accept=".pocketcut,.json,application/json,application/zip,application/x-zip-compressed";
   $("#projectFileInput").onchange=e=>e.target.files[0]&&importProjectFile(e.target.files[0]);
   $("#settingsBtn").onclick=()=>{syncSettingsUI();els.settingsDialog.showModal();};
   $("#closeSettingsDialog").onclick=()=>els.settingsDialog.close();
